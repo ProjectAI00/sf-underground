@@ -1,55 +1,58 @@
 // In-game radio, top-center HUD. Two backends:
-//  1. Built-in internet radio stations (SomaFM streams) — work instantly.
-//  2. Spotify Connect: the game registers as a Spotify playback device via the
-//     Web Playback SDK (requires Spotify Premium + a user-created app Client
-//     ID, PKCE flow — no server needed). Pick "SF UNDERGROUND RADIO" in any
-//     Spotify app and music/podcasts play here with track info in the HUD.
+//  1. Internet radio streams (SomaFM) — unlimited users, no API.
+//  2. Spotify stations (playlist / show / podcast) — each player uses their
+//     own Premium login; API calls only when you change station (~3 per tune).
+//
+// Curate stations in data/radio-stations.json (no server, no shared quota).
 
-const STATIONS = [
+import { parseSpotify } from "./spotify-uri.js";
+
+const FALLBACK_STATIONS = [
   { id: "off", name: "RADIO OFF", tag: "" },
-  { id: "u80s", name: "UNDERGROUND 80s", tag: "SYNTH // NEW WAVE", url: "https://ice2.somafm.com/u80s-128-mp3" },
   { id: "groove", name: "GROOVE SALAD", tag: "CHILL BEATS", url: "https://ice1.somafm.com/groovesalad-128-mp3" },
-  { id: "defcon", name: "DEF CON RADIO", tag: "HACKER ELECTRONIC", url: "https://ice1.somafm.com/defcon-128-mp3" },
-  { id: "secret", name: "SECRET AGENT", tag: "SPY LOUNGE", url: "https://ice1.somafm.com/secretagent-128-mp3" },
-  { id: "metal", name: "METAL DETECTOR", tag: "METAL", url: "https://ice1.somafm.com/metal-128-mp3" },
-  { id: "spotify", name: "SPOTIFY", tag: "CONNECT YOUR ACCOUNT" },
 ];
 
-const SPOTIFY_SCOPES = "streaming user-read-email user-read-private user-read-playback-state user-modify-playback-state";
+const SPOTIFY_SCOPES = [
+  "streaming",
+  "user-read-email",
+  "user-read-private",
+  "user-read-playback-state",
+  "user-modify-playback-state",
+  "playlist-read-private",
+  "playlist-read-collaborative",
+].join(" ");
 const LS = {
   station: "sfradio_station",
   volume: "sfradio_volume",
   clientId: "sfradio_sp_client",
   refresh: "sfradio_sp_refresh",
   verifier: "sfradio_sp_verifier",
+  playlist: "sfradio_sp_playlist",
+  bossTracks: "sfradio_sp_boss_tracks",
 };
 
 export class Radio {
   constructor() {
+    this.stations = [...FALLBACK_STATIONS];
     this.idx = 0;
     this.audio = new Audio();
     this.audio.crossOrigin = "anonymous";
     this.audio.volume = parseFloat(localStorage.getItem(LS.volume) || "0.5");
     this.status = ""; // "", "TUNING...", error text
-    this.spotify = { player: null, token: null, expires: 0, track: "", paused: true, connecting: false };
+    this.spotify = {
+      player: null,
+      deviceId: null,
+      token: null,
+      expires: 0,
+      track: "",
+      paused: true,
+      connecting: false,
+      ready: false,
+    };
 
     this.#buildUI();
     this.#handleAuthCallback();
-
-    const saved = localStorage.getItem(LS.station);
-    const savedIdx = STATIONS.findIndex((s) => s.id === saved);
-    // resume saved station on first user gesture (autoplay policy)
-    if (savedIdx > 0) {
-      this.pendingIdx = savedIdx;
-      const resume = () => {
-        if (this.pendingIdx != null) this.tuneTo(this.pendingIdx);
-        this.pendingIdx = null;
-        window.removeEventListener("keydown", resume);
-        window.removeEventListener("pointerdown", resume);
-      };
-      window.addEventListener("keydown", resume);
-      window.addEventListener("pointerdown", resume);
-    }
+    this.#loadStations().then(() => this.#afterStationsLoaded());
 
     this.audio.addEventListener("playing", () => { this.status = ""; this.#render(); });
     this.audio.addEventListener("waiting", () => { this.status = "TUNING..."; this.#render(); });
@@ -58,10 +61,15 @@ export class Radio {
     });
   }
 
-  station() { return STATIONS[this.idx]; }
+  station() { return this.stations[this.idx]; }
+
+  /** True if this station plays via the user's Spotify account. */
+  #isSpotifyStation(st) {
+    return Boolean(st?.spotify);
+  }
 
   cycle(dir = 1) {
-    this.tuneTo((this.idx + dir + STATIONS.length) % STATIONS.length);
+    this.tuneTo((this.idx + dir + this.stations.length) % this.stations.length);
   }
 
   tuneTo(i) {
@@ -70,16 +78,21 @@ export class Radio {
     localStorage.setItem(LS.station, st.id);
     this.status = "";
 
-    // stop whatever was playing
     this.audio.pause();
-    if (this.spotify.player && st.id !== "spotify") this.spotify.player.pause().catch(() => {});
+    if (this.spotify.player && !this.#isSpotifyStation(st)) {
+      this.spotify.player.pause().catch(() => {});
+    }
 
     if (st.url) {
       this.status = "TUNING...";
       this.audio.src = st.url;
       this.audio.play().catch(() => { this.status = "CLICK TO PLAY"; this.#render(); });
-    } else if (st.id === "spotify") {
-      this.#initSpotify();
+    } else if (this.#isSpotifyStation(st)) {
+      if (!this.isSpotifyConnected()) {
+        this.status = "CLICK TO CONNECT SPOTIFY";
+      } else {
+        this.#playStationSpotify(st).catch(() => {});
+      }
     }
     this.#flash();
     this.#render();
@@ -91,6 +104,80 @@ export class Radio {
     if (this.spotify.player) this.spotify.player.setVolume(this.audio.volume).catch(() => {});
     this.#render();
   }
+
+  /** Campaign boss — one track per race. */
+  async playBossTrack(mission) {
+    if (!mission) return;
+    await this.#ensureSpotify({ keepStation: true });
+    if (!(await this.#waitReady())) return;
+
+    const overrides = this.#bossOverrides();
+    const raw = overrides[mission.id] || mission.track || "";
+    const parsed = parseSpotify(raw);
+    if (parsed) {
+      try {
+        await this.#playParsed(parsed, { shuffle: false });
+      } catch (e) {
+        this.status = String(e.message || "PLAY FAILED").slice(0, 40).toUpperCase();
+        this.#render();
+      }
+      return;
+    }
+    const q = mission.trackQuery;
+    if (!q) return;
+    try {
+      await this.#playSearch(q);
+    } catch (e) {
+      this.status = String(e.message || "PLAY FAILED").slice(0, 40).toUpperCase();
+      this.#render();
+    }
+  }
+
+  /** Free roam / multiplayer — play whatever station is currently selected. */
+  async playSessionPlaylist() {
+    const st = this.station();
+    if (!this.#isSpotifyStation(st)) return;
+    await this.#playStationSpotify(st);
+  }
+
+  async #playStationSpotify(st) {
+    await this.#ensureSpotify();
+    if (!(await this.#waitReady())) return;
+
+    let raw = st.spotify;
+    if (st.id === "drive") {
+      const override = localStorage.getItem(LS.playlist);
+      if (override) raw = override;
+    }
+    if (!raw || String(raw).includes("YOUR_")) {
+      this.status = "EDIT data/radio-stations.json";
+      this.#render();
+      return;
+    }
+
+    const parsed = parseSpotify(raw);
+    if (!parsed) {
+      this.status = "BAD SPOTIFY URI";
+      this.#render();
+      return;
+    }
+
+    const shuffle = st.shuffle ?? (parsed.type === "playlist" || parsed.type === "album");
+    try {
+      this.status = "TUNING...";
+      this.#render();
+      await this.#playParsed(parsed, { shuffle });
+      this.status = "";
+    } catch (e) {
+      this.status = String(e.message || "PLAY FAILED").slice(0, 40).toUpperCase();
+    }
+    this.#render();
+  }
+
+  getPlaylistUri() { return localStorage.getItem(LS.playlist) || ""; }
+  setPlaylistUri(v) { localStorage.setItem(LS.playlist, v.trim()); }
+
+  isSpotifyConnected() { return Boolean(this.spotify.token); }
 
   /** main keydown hook; returns true if consumed */
   handleKey(e) {
@@ -129,6 +216,8 @@ export class Radio {
       #sp-modal input { width: 100%; box-sizing: border-box; background: #0c0d12; border: 2px solid #3a362c;
         color: #ffc24b; font-family: inherit; font-size: 10px; padding: 9px; margin: 8px 0 14px; }
       #sp-modal input:focus { outline: none; border-color: #ffc24b; }
+      #sp-modal .lbl { color: #8d8472; font-size: 8px; margin-top: 10px; }
+      #sp-modal .hint { color: #5b5345; font-size: 7px; line-height: 1.8; margin-bottom: 10px; }
       #sp-modal .row { display: flex; gap: 10px; }
       #sp-modal button { flex: 1; background: #1ed760; border: 0; color: #07140b; font-family: inherit;
         font-size: 10px; padding: 11px; cursor: pointer; }
@@ -158,9 +247,52 @@ export class Radio {
     });
     this.el.querySelector(".pill").addEventListener("click", () => {
       const st = this.station();
-      if (st.id === "spotify" && !this.spotify.token) this.#showSpotifySetup();
+      if (this.#isSpotifyStation(st) && !this.isSpotifyConnected()) this.#showSpotifySetup();
+      else if (this.#isSpotifyStation(st) && this.isSpotifyConnected()) this.#playStationSpotify(st).catch(() => {});
       else if (st.url && this.audio.paused) this.audio.play().catch(() => {});
     });
+
+    let touchX = null;
+    this.el.addEventListener("touchstart", (e) => {
+      touchX = e.changedTouches[0]?.clientX ?? null;
+    }, { passive: true });
+    this.el.addEventListener("touchend", (e) => {
+      if (touchX == null) return;
+      const dx = (e.changedTouches[0]?.clientX ?? touchX) - touchX;
+      touchX = null;
+      if (Math.abs(dx) > 36) this.cycle(dx < 0 ? 1 : -1);
+    }, { passive: true });
+
+    this.#render();
+  }
+
+  async #loadStations() {
+    try {
+      const res = await fetch("data/radio-stations.json");
+      if (!res.ok) return;
+      const data = await res.json();
+      if (Array.isArray(data.stations) && data.stations.length) {
+        this.stations = data.stations;
+      }
+    } catch {
+      /* offline / missing file — use fallback */
+    }
+  }
+
+  #afterStationsLoaded() {
+    const saved = localStorage.getItem(LS.station);
+    const savedIdx = this.stations.findIndex((s) => s.id === saved);
+    if (savedIdx > 0) {
+      this.pendingIdx = savedIdx;
+      const resume = () => {
+        if (this.pendingIdx != null) this.tuneTo(this.pendingIdx);
+        this.pendingIdx = null;
+        window.removeEventListener("keydown", resume);
+        window.removeEventListener("pointerdown", resume);
+      };
+      window.addEventListener("keydown", resume);
+      window.addEventListener("pointerdown", resume);
+    }
     this.#render();
   }
 
@@ -170,11 +302,11 @@ export class Radio {
     this.volEl.textContent = "VOL " + Math.round(this.audio.volume * 10);
     let sub = st.tag || "";
     if (this.status) sub = this.status;
-    if (st.id === "spotify") {
+    if (this.#isSpotifyStation(st)) {
       if (this.spotify.connecting) sub = "CONNECTING...";
       else if (this.spotify.track) sub = `<span class="track">${escapeHtml(this.spotify.track)}</span>`;
-      else if (this.spotify.token) sub = "PICK 'SF UNDERGROUND RADIO' IN YOUR SPOTIFY APP";
-      else sub = "CLICK TO CONNECT (PREMIUM)";
+      else if (this.spotify.token) sub = st.tag || "SPOTIFY";
+      else sub = "TAP TO CONNECT (PREMIUM)";
     }
     this.subEl.innerHTML = sub + (st.id !== "off" && !this.status ? "" : "");
   }
@@ -196,17 +328,21 @@ export class Radio {
     const modal = document.createElement("div");
     modal.id = "sp-modal";
     const cid = localStorage.getItem(LS.clientId) || "";
+    const pl = localStorage.getItem(LS.playlist) || "";
     modal.innerHTML = `
       <div class="box">
         <h3>CONNECT SPOTIFY</h3>
-        <div>One-time setup (needs Spotify <b>Premium</b>):</div>
+        <div>Needs Spotify <b>Premium</b>. Dev API is free — you create a one-time app.</div>
         <ol>
-          <li>Open <a href="https://developer.spotify.com/dashboard" target="_blank">developer.spotify.com/dashboard</a> → CREATE APP</li>
-          <li>Name: anything · Redirect URI: <code>${this.#redirectUri()}</code> · check "Web Playback SDK"</li>
-          <li>Copy the app's <b>Client ID</b> and paste it below</li>
+          <li><a href="https://developer.spotify.com/dashboard" target="_blank">developer.spotify.com/dashboard</a> → CREATE APP</li>
+          <li>Redirect URI: <code>${this.#redirectUri()}</code> · enable <b>Web Playback SDK</b></li>
+          <li>Paste <b>Client ID</b> below</li>
         </ol>
-        <div>TIP: open the game via <code>http://127.0.0.1:8847/</code> — Spotify accepts that as a redirect URI.</div>
+        <div class="lbl">CLIENT ID</div>
         <input id="sp-cid" placeholder="SPOTIFY CLIENT ID" value="${escapeHtml(cid)}" spellcheck="false" />
+        <div class="lbl">OPTIONAL — override NIGHT DRIVE playlist (local only)</div>
+        <input id="sp-pl" placeholder="https://open.spotify.com/playlist/..." value="${escapeHtml(pl)}" spellcheck="false" />
+        <div class="hint">Stations live in <code>data/radio-stations.json</code> — playlist, podcast show, or episode URLs. Each player logs into their own Spotify (Premium). Tuning costs ~3 API calls; streams cost zero. SomaFM stations need no login.</div>
         <div class="row">
           <button id="sp-go">CONNECT →</button>
           <button class="alt" id="sp-cancel">CANCEL</button>
@@ -217,8 +353,15 @@ export class Radio {
     modal.querySelector("#sp-cancel").addEventListener("click", () => modal.remove());
     modal.querySelector("#sp-go").addEventListener("click", async () => {
       const id = modal.querySelector("#sp-cid").value.trim();
-      if (id.length < 16) return;
-      localStorage.setItem(LS.clientId, id);
+      const pl = modal.querySelector("#sp-pl").value.trim();
+      if (id.length < 16 && !this.spotify.token) return;
+      if (id.length >= 16) localStorage.setItem(LS.clientId, id);
+      if (pl) localStorage.setItem(LS.playlist, pl);
+      modal.remove();
+      if (this.spotify.token) {
+        this.#playStationSpotify(this.station()).catch(() => {});
+        return;
+      }
       await this.#startAuth(id);
     });
   }
@@ -260,9 +403,15 @@ export class Radio {
       const tok = await res.json();
       if (tok.access_token) {
         this.#storeToken(tok);
-        this.idx = STATIONS.findIndex((s) => s.id === "spotify");
-        localStorage.setItem(LS.station, "spotify");
-        this.#initSpotify();
+        const firstSp = this.stations.findIndex((s) => this.#isSpotifyStation(s));
+        const saved = localStorage.getItem(LS.station);
+        const savedIdx = this.stations.findIndex((s) => s.id === saved);
+        this.idx = savedIdx >= 0 && this.#isSpotifyStation(this.stations[savedIdx])
+          ? savedIdx
+          : Math.max(firstSp, 0);
+        localStorage.setItem(LS.station, this.station().id);
+        await this.#initSpotify();
+        this.#playStationSpotify(this.station()).catch(() => {});
       }
     } catch {
       this.status = "AUTH FAILED";
@@ -293,8 +442,96 @@ export class Radio {
     return null;
   }
 
+  async #ensureSpotify({ keepStation = false } = {}) {
+    if (!keepStation) {
+      const st = this.station();
+      if (!this.#isSpotifyStation(st)) {
+        const idx = this.stations.findIndex((s) => this.#isSpotifyStation(s));
+        if (idx >= 0) this.idx = idx;
+      }
+    }
+    await this.#initSpotify();
+  }
+
+  async #waitReady(timeoutMs = 10000) {
+    await this.#initSpotify();
+    const t0 = Date.now();
+    while (Date.now() - t0 < timeoutMs) {
+      if (this.spotify.ready && this.spotify.deviceId) return true;
+      await new Promise((r) => setTimeout(r, 150));
+    }
+    return false;
+  }
+
+  #bossOverrides() {
+    try { return JSON.parse(localStorage.getItem(LS.bossTracks) || "{}"); }
+    catch { return {}; }
+  }
+
+  async #api(method, path, body) {
+    const token = await this.#freshToken();
+    if (!token) throw new Error("no token");
+    const res = await fetch("https://api.spotify.com/v1" + path, {
+      method,
+      headers: {
+        Authorization: "Bearer " + token,
+        ...(body ? { "Content-Type": "application/json" } : {}),
+      },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    if (res.status === 204) return null;
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error?.message || res.statusText);
+    return data;
+  }
+
+  async #transferToGameDevice() {
+    const id = this.spotify.deviceId;
+    if (!id) return;
+    await this.#api("PUT", "/me/player", { device_ids: [id], play: false });
+  }
+
+  async #playParsed(parsed, { shuffle = false } = {}) {
+    if (!parsed) return;
+    await this.#transferToGameDevice();
+
+    if (parsed.type === "track" || parsed.type === "episode") {
+      await this.#api("PUT", "/me/player/play?device_id=" + encodeURIComponent(this.spotify.deviceId), {
+        uris: [parsed.uri],
+      });
+      return;
+    }
+
+    if (parsed.type === "playlist" || parsed.type === "album" || parsed.type === "show") {
+      await this.#api("PUT", "/me/player/shuffle?state=" + (shuffle ? "true" : "false") + "&device_id=" + encodeURIComponent(this.spotify.deviceId));
+      await this.#api("PUT", "/me/player/play?device_id=" + encodeURIComponent(this.spotify.deviceId), {
+        context_uri: parsed.uri,
+      });
+    }
+  }
+
+  async #playSearch(query) {
+    const data = await this.#api("GET", "/search?" + new URLSearchParams({
+      q: query,
+      type: "track",
+      limit: "1",
+    }));
+    const track = data.tracks?.items?.[0];
+    if (!track?.uri) {
+      this.status = "TRACK NOT FOUND";
+      this.#render();
+      return;
+    }
+    await this.#playParsed(parseSpotify(track.uri));
+  }
+
   async #initSpotify() {
-    if (this.spotify.player) { this.spotify.player.activateElement?.(); this.#render(); return; }
+    if (this.spotify.player) {
+      this.spotify.player.activateElement?.();
+      if (this.spotify.deviceId) this.spotify.ready = true;
+      this.#render();
+      return;
+    }
     const token = await this.#freshToken();
     if (!token) { this.#render(); return; } // not connected yet -> click to set up
     this.spotify.connecting = true;
@@ -310,7 +547,7 @@ export class Radio {
     }
 
     const player = new window.Spotify.Player({
-      name: "SF UNDERGROUND RADIO",
+      name: "RETRO RACER SF",
       getOAuthToken: (cb) => this.#freshToken().then((t) => cb(t)),
       volume: this.audio.volume,
     });
@@ -321,7 +558,12 @@ export class Radio {
       this.spotify.track = tr ? `${tr.name} — ${tr.artists.map((a) => a.name).join(", ")}` : "";
       this.#render();
     });
-    player.addListener("ready", () => { this.spotify.connecting = false; this.#render(); });
+    player.addListener("ready", ({ device_id }) => {
+      this.spotify.deviceId = device_id;
+      this.spotify.connecting = false;
+      this.spotify.ready = true;
+      this.#render();
+    });
     player.addListener("initialization_error", () => { this.status = "SDK ERROR"; this.spotify.connecting = false; this.#render(); });
     player.addListener("authentication_error", () => { this.status = "AUTH ERROR"; this.spotify.connecting = false; this.#render(); });
     player.addListener("account_error", () => { this.status = "PREMIUM REQUIRED"; this.spotify.connecting = false; this.#render(); });

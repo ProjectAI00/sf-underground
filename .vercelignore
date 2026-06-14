@@ -1,0 +1,7 @@
+.factory/
+tools/
+data/raw/
+data/sf_raw.json
+data/sf_map.json
+*.log
+.DS_Store

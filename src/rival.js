@@ -6,6 +6,7 @@
 
 import { drawCarSprite } from "./car.js";
 import { makeCarSpriteFor, physFor } from "./cars.js";
+import { elevOffset } from "./terrain.js";
 
 const CP_RADIUS = 30;
 
@@ -59,62 +60,81 @@ export class Rival {
       this.cpIndex++;
     }
 
-    // rubber-band vs player progress (gentle)
+    // Catch-up mechanics - keeps races competitive
     let band = 1;
     if (playerProgress) {
       const lead = (this.cpIndex - playerProgress.cp) * 600 + (playerProgress.dist - this.progress().dist);
-      if (lead > 350) band = 0.9;        // rival far ahead: ease off
-      else if (lead < -350) band = 1.1;  // rival far behind: push
+      // More aggressive catch-up to keep races close
+      if (lead > 800) band = 0.88;       // rival way ahead: ease off significantly
+      else if (lead > 400) band = 0.94;  // rival ahead: ease off
+      else if (lead < -800) band = 1.12; // rival way behind: push hard
+      else if (lead < -400) band = 1.06; // rival behind: push
+      // Also factor in direct distance - if rival is very far, more catch-up
+      if (dToPlayer > 300 && lead < -200) band = Math.min(band * 1.1, 1.15);
     }
 
     const dToPlayer = Math.hypot(player.x - this.x, player.y - this.y);
     const directH = Math.atan2(dyT, dxT);
 
     if (dToPlayer > 700) {
-      // coarse off-screen simulation: bee-line at cruise pace
-      const cruise = 19 * this.skill * band;
-      this.v += (cruise - this.v) * Math.min(1, 1.5 * dt);
-      this.h += angDiff(directH, this.h) * Math.min(1, 2.5 * dt);
+      // coarse off-screen simulation: fast cruise toward checkpoint
+      const cruise = this.phys.topSpeed * this.skill * 0.85 * band;
+      this.v += (cruise - this.v) * Math.min(1, 3 * dt);
+      this.h += angDiff(directH, this.h) * Math.min(1, 4 * dt);
       this.x += Math.cos(this.h) * this.v * dt;
       this.y += Math.sin(this.h) * this.v * dt;
       return;
     }
 
-    // on-screen: drive like a street racer
+    // on-screen: drive like an aggressive street racer
     let desiredH = directH;
-    const near = this.world.nearestRoad(this.x, this.y, 60);
-    if (near && near.d < 26) {
+    const near = this.world.nearestRoad(this.x, this.y, 80);
+    if (near && near.d < 30) {
       // follow the road in whichever direction makes progress toward the target
       const sign = near.tx * dxT + near.ty * dyT >= 0 ? 1 : -1;
       const roadH = Math.atan2(near.ty * sign, near.tx * sign);
-      // blend road-following with direct seeking; drift toward centerline
-      const w = Math.min(0.75, 0.25 + near.d * 0.04);
-      desiredH = blendAngles(roadH, directH, w * 0.45);
-      // gentle pull back to the road center
+      // More aggressive: blend heavily toward target when close, follow road when far
+      const targetDist = Math.hypot(dxT, dyT);
+      const blendFactor = targetDist < 100 ? 0.6 : 0.35; // More direct when close to checkpoint
+      desiredH = blendAngles(roadH, directH, blendFactor);
+      // Less strict centerline following - can use full road width
       const pullX = near.x - this.x, pullY = near.y - this.y;
-      if (near.d > near.road.w * 0.32) {
-        desiredH = blendAngles(desiredH, Math.atan2(pullY, pullX), 0.25);
+      if (near.d > near.road.w * 0.4) {
+        desiredH = blendAngles(desiredH, Math.atan2(pullY, pullX), 0.2);
       }
+    } else {
+      // Off-road or far from road - head directly toward checkpoint
+      desiredH = directH;
     }
 
-    // building avoidance probe
-    const probeX = this.x + Math.cos(this.h) * 5, probeY = this.y + Math.sin(this.h) * 5;
+    // building avoidance probe - check further ahead at high speed
+    const probeLen = 5 + this.v * 0.15;
+    const probeX = this.x + Math.cos(this.h) * probeLen;
+    const probeY = this.y + Math.sin(this.h) * probeLen;
     let blocked = false;
     if (this.world.buildingAt(probeX, probeY)) {
       blocked = true;
-      const side = this.world.buildingAt(
-        this.x + Math.cos(this.h + 0.7) * 5, this.y + Math.sin(this.h + 0.7) * 5) ? -1 : 1;
-      desiredH = this.h + side * 1.1;
+      // Check both sides to find clear path
+      const leftClear = !this.world.buildingAt(
+        this.x + Math.cos(this.h + 0.8) * probeLen, this.y + Math.sin(this.h + 0.8) * probeLen);
+      const rightClear = !this.world.buildingAt(
+        this.x + Math.cos(this.h - 0.8) * probeLen, this.y + Math.sin(this.h - 0.8) * probeLen);
+      const side = leftClear && !rightClear ? 1 : rightClear && !leftClear ? -1 : (Math.random() < 0.5 ? 1 : -1);
+      desiredH = this.h + side * 1.3;
     }
 
     const turn = angDiff(desiredH, this.h);
-    this.h += clamp(turn, -2.6 * dt * Math.min(1, this.v / 6 + 0.3), 2.6 * dt * Math.min(1, this.v / 6 + 0.3));
+    // Faster, more aggressive steering
+    const turnRate = 3.5 * Math.min(1.2, this.v / 8 + 0.4);
+    this.h += clamp(turn, -turnRate * dt, turnRate * dt);
 
-    // speed: corner-aware
+    // speed: corner-aware but more aggressive
     const top = this.phys.topSpeed * this.skill * band;
-    const cornerSlow = Math.max(0.32, 1 - Math.abs(turn) * 1.15);
-    const targetV = blocked ? 6 : top * cornerSlow;
-    const rate = targetV > this.v ? this.phys.engine * 0.55 : this.phys.brake * 0.8;
+    // Less slowdown for corners - rival takes more risks
+    const cornerSlow = Math.max(0.45, 1 - Math.abs(turn) * 0.85);
+    const targetV = blocked ? 10 : top * cornerSlow;
+    // Faster acceleration and braking
+    const rate = targetV > this.v ? this.phys.engine * 0.85 : this.phys.brake * 1.1;
     this.v += clamp(targetV - this.v, -rate * dt, rate * dt);
 
     const nx = this.x + Math.cos(this.h) * this.v * dt;
@@ -140,24 +160,25 @@ export class Rival {
   draw(ctx, camX, camY, viewR) {
     const dx = this.x - camX, dy = this.y - camY;
     if (dx * dx + dy * dy > viewR * viewR) return;
+    const vy = this.y + elevOffset(this.x, this.y);
     // aura boss glow
     if (this.def.stats.aura >= 9) {
       ctx.save();
-      ctx.translate(this.x, this.y);
+      ctx.translate(this.x, vy);
       ctx.rotate(this.h + Math.PI / 2);
       ctx.fillStyle = "rgba(255,90,60,0.25)";
       ctx.fillRect(-1.4, -2.6, 2.8, 5.2);
       ctx.restore();
     }
-    drawCarSprite(ctx, this.sprite, this.x, this.y, this.h);
+    drawCarSprite(ctx, this.sprite, this.x, vy, this.h);
     // name tag
     ctx.font = '1.1px "Press Start 2P", monospace';
     ctx.textAlign = "center";
     ctx.fillStyle = "rgba(10,10,14,0.65)";
     const wTag = this.mission.name.length * 1.15 + 1;
-    ctx.fillRect(this.x - wTag / 2, this.y - 5.6, wTag, 1.9);
+    ctx.fillRect(this.x - wTag / 2, vy - 5.6, wTag, 1.9);
     ctx.fillStyle = "#ffc24b";
-    ctx.fillText(this.mission.name, this.x, this.y - 4.2);
+    ctx.fillText(this.mission.name, this.x, vy - 4.2);
   }
 }
 

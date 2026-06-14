@@ -1,7 +1,22 @@
+import { elevOffset } from "./terrain.js";
+
 const SHIRTS = ["#4778a8", "#b84f47", "#5f8c54", "#d6a64a", "#7d5ea8", "#c87542", "#4f9a98", "#d8d3bd"];
 const SKIN = ["#c98f65", "#8e5c43", "#dfb38a"];
 const HAIR = ["#211915", "#5a3b26", "#d8c27a"];
-const TARGET_PEDS = 26;
+const BASE_TARGET_PEDS = 35;  // reduced from 60 for performance
+
+function getPedTarget() {
+  const forced = globalThis.__forceHour;
+  const hour = typeof forced === "number" ? forced : new Date().getHours();
+  
+  // Daytime busy, night quiet
+  if (hour >= 11 && hour < 14) return Math.floor(BASE_TARGET_PEDS * 1.4);  // lunch crowds
+  if (hour >= 17 && hour < 20) return Math.floor(BASE_TARGET_PEDS * 1.3);  // evening activity
+  if (hour >= 23 || hour < 6) return Math.floor(BASE_TARGET_PEDS * 0.15);  // late night
+  if (hour >= 6 && hour < 8) return Math.floor(BASE_TARGET_PEDS * 0.5);    // early morning
+  if (hour >= 8 && hour < 11) return Math.floor(BASE_TARGET_PEDS * 1.1);   // morning commute
+  return BASE_TARGET_PEDS;
+}
 const QUERY_R = 220;
 const DESPAWN_R2 = 280 * 280;
 const MIN_SPAWN_R2 = 40 * 40;
@@ -14,6 +29,7 @@ export class Peds {
     this.peds = [];
     this.sprites = null;
     this.tmp = { x: 0, y: 0, tx: 1, ty: 0 };
+    this.hitCount = 0;
   }
 
   update(dt, car) {
@@ -73,7 +89,8 @@ export class Peds {
   }
 
   #spawnNear(car) {
-    const need = Math.min(TARGET_PEDS - this.peds.length, SPAWNS_PER_TICK);
+    const target = getPedTarget();
+    const need = Math.min(target - this.peds.length, SPAWNS_PER_TICK);
     if (need <= 0) return;
 
     const roads = this.world.roadsNear(car.x, car.y, QUERY_R);
@@ -83,23 +100,28 @@ export class Peds {
     for (let tries = 0; spawned < need && tries < SPAWN_TRIES; tries++) {
       const road = roads[(Math.random() * roads.length) | 0];
       if (!road || !road.p || road.p.length < 4) continue;
+      
+      // Only spawn on actual streets with sidewalks (skip paths, beaches, parks)
+      const isSidewalkRoad = road.w >= 6 && road.w <= 25;
+      if (!isSidewalkRoad) continue;
 
       const len = polyLen(road.p);
       if (len < 12) continue;
 
       const s = Math.random() * len;
       const side = Math.random() < 0.5 ? -1 : 1;
-      const off = side * (road.w / 2 + 2.5 + Math.random() * 1.5);
+      // Sidewalk offset: just outside road edge
+      const sidewalkOff = side * (road.w / 2 + 2.0 + Math.random() * 1.0);
       pointAt(road.p, s, this.tmp);
-      const x = this.tmp.x + -this.tmp.ty * off;
-      const y = this.tmp.y + this.tmp.tx * off;
+      const x = this.tmp.x + -this.tmp.ty * sidewalkOff;
+      const y = this.tmp.y + this.tmp.tx * sidewalkOff;
       const dx = x - car.x, dy = y - car.y;
       if (dx * dx + dy * dy < MIN_SPAWN_R2) continue;
       if (this.world.buildingAt(x, y)) continue;
 
       const dir = Math.random() < 0.5 ? -1 : 1;
       this.peds.push({
-        road, len, s, side, off, dir, x, y,
+        road, len, s, side, off: sidewalkOff, dir, x, y,
         h: Math.atan2(this.tmp.ty * dir, this.tmp.tx * dir),
         speed: 0.8 + Math.random() * 0.8,
         state: "walk",
@@ -213,6 +235,7 @@ export class Peds {
   }
 
   #hit(p, car, carSpeed) {
+    this.hitCount++;
     let fx = car.vx, fy = car.vy;
     const spd = carSpeed || Math.hypot(fx, fy);
     if (spd > 0.1) {
@@ -234,32 +257,57 @@ export class Peds {
   }
 
   #drawStanding(ctx, p) {
-    const sway = Math.sin(p.phase) * (p.state === "flee" ? 0.18 : 0.14);
-    const bob = 1 + Math.sin(p.phase * 2) * 0.06;
+    const vy = p.y + elevOffset(p.x, p.y);
+    const shirt = SHIRTS[p.spriteIndex % SHIRTS.length];
+    const hair = HAIR[(p.spriteIndex * 2) % HAIR.length];
 
     ctx.save();
-    ctx.translate(p.x, p.y);
-    ctx.fillStyle = "rgba(10,8,6,0.28)";
-    ctx.fillRect(-0.25, 0.12, 0.5, 0.18);
-    ctx.rotate(p.h + sway);
-    ctx.scale(bob, bob);
-    ctx.imageSmoothingEnabled = false;
-    ctx.drawImage(this.#sprite(p.spriteIndex), -0.275, -0.225, 0.55, 0.45);
+    ctx.translate(p.x, vy);
+
+    // Simple shadow
+    ctx.fillStyle = "rgba(10,8,6,0.3)";
+    ctx.beginPath();
+    ctx.ellipse(0, 0, 0.7, 0.5, 0, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Simple top-down person: head + shoulders as oval
+    ctx.fillStyle = shirt;
+    ctx.beginPath();
+    ctx.ellipse(0, 0, 0.5, 0.4, p.h, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Head (smaller circle at front based on heading)
+    const hx = Math.cos(p.h) * 0.2;
+    const hy = Math.sin(p.h) * 0.2;
+    ctx.fillStyle = hair;
+    ctx.beginPath();
+    ctx.arc(hx, hy, 0.25, 0, Math.PI * 2);
+    ctx.fill();
+
     ctx.restore();
   }
 
   #drawDown(ctx, p) {
     const alpha = Math.max(0, 1 - Math.max(0, p.downT - 0.4) / 4);
+    const vy = p.y + elevOffset(p.x, p.y);
+    const shirt = SHIRTS[p.spriteIndex % SHIRTS.length];
+
     ctx.save();
     ctx.globalAlpha *= alpha;
-    ctx.translate(p.x, p.y);
-    ctx.rotate(p.h);
+    ctx.translate(p.x, vy);
+
+    // Shadow
     ctx.fillStyle = "rgba(10,8,6,0.25)";
-    ctx.fillRect(-0.34, -0.17, 0.68, 0.34);
-    ctx.fillStyle = SHIRTS[p.spriteIndex % SHIRTS.length];
-    ctx.fillRect(-0.28, -0.12, 0.56, 0.24);
-    ctx.fillStyle = SKIN[p.spriteIndex % SKIN.length];
-    ctx.fillRect(0.18, -0.11, 0.18, 0.22);
+    ctx.beginPath();
+    ctx.ellipse(0, 0, 0.8, 0.5, p.h, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Fallen person - elongated shape
+    ctx.fillStyle = shirt;
+    ctx.beginPath();
+    ctx.ellipse(0, 0, 0.7, 0.35, p.h, 0, Math.PI * 2);
+    ctx.fill();
+
     ctx.restore();
   }
 

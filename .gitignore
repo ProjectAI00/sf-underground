@@ -1,3 +1,7 @@
 .DS_Store
 *.log
 data/raw/
+data/sf_raw.json
+data/sf_map.json
+.factory/
+server/node_modules/

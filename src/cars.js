@@ -2,7 +2,32 @@
 // Stats map to physics in Car (speed -> top speed, accel -> engine, brakes,
 // cornering -> grip/steering). Aura is... aura. It glows.
 
+import { SPRITE_PPM, drawCarBase, drawGlass, drawLights } from "./car.js";
+import { getCachedSprite, imageToCanvas } from "./car-sprites.js";
+
 export const CARS = [
+  // C-tier: Entry level, max ~140 km/h
+  {
+    id: "civic",
+    name: "HONDA CIVIC EG",
+    tier: "C",
+    color: "#e8e4d8",
+    accent: "#1a1a1e",
+    stats: { speed: 4, accel: 5, brakes: 5, cornering: 7, aura: 6 },
+    blurb: "VTEC KICKED IN YO. RICE LEGEND.",
+    shape: "coupe",
+  },
+  {
+    id: "miata",
+    name: "MAZDA MX-5 NA",
+    tier: "C",
+    color: "#c41e24",
+    accent: "#1a1a1e",
+    stats: { speed: 3, accel: 4, brakes: 6, cornering: 9, aura: 8 },
+    blurb: "MIATA IS ALWAYS THE ANSWER.",
+    shape: "wedge",
+  },
+  // B-tier: Street cars, max ~180 km/h
   {
     id: "944",
     name: "PORSCHE 944",
@@ -25,7 +50,8 @@ export const CARS = [
   },
   {
     id: "teslas",
-    name: "TESLA MODEL S TECHBRO ED.",
+    name: "TESLA MODEL S",
+    edition: "TECH BRO EDITION",
     tier: "B",
     color: "#e8e6e1",
     accent: "#2a2a30",
@@ -43,29 +69,138 @@ export const CARS = [
     blurb: "GODZILLA. MIDNIGHT LEGEND.",
     shape: "coupe",
   },
+  // A-tier: Sports/tuned cars, max ~240 km/h
+  {
+    id: "911gt3",
+    name: "PORSCHE 911 GT3",
+    tier: "A",
+    color: "#f5f5f0",
+    accent: "#e85d04",
+    stats: { speed: 8, accel: 7, brakes: 9, cornering: 9, aura: 8 },
+    blurb: "REAR ENGINE PERFECTION. TRACK WEAPON.",
+    shape: "coupe",
+  },
+  {
+    id: "amggt",
+    name: "MERCEDES AMG GT",
+    tier: "A",
+    color: "#2d2d2d",
+    accent: "#c4a035",
+    stats: { speed: 9, accel: 8, brakes: 8, cornering: 7, aura: 7 },
+    blurb: "TWIN TURBO V8. GERMAN MUSCLE.",
+    shape: "coupe",
+  },
+  {
+    id: "nsx",
+    name: "HONDA NSX '91",
+    tier: "A",
+    color: "#c41e24",
+    accent: "#1a1a1e",
+    stats: { speed: 7, accel: 7, brakes: 8, cornering: 10, aura: 9 },
+    blurb: "SENNA'S DAILY. MID-ENGINE PURITY.",
+    shape: "wedge",
+  },
+  // S-tier: Supercars, max ~300 km/h
+  {
+    id: "f1lm",
+    name: "MCLAREN F1 LM",
+    tier: "S",
+    color: "#f28c00",
+    accent: "#1a1a1e",
+    stats: { speed: 10, accel: 8, brakes: 8, cornering: 8, aura: 10 },
+    blurb: "GOLD-LINED V12. THE GOAT.",
+    shape: "f1",
+  },
+  {
+    id: "laferrari",
+    name: "FERRARI LAFERRARI",
+    tier: "S",
+    color: "#cc0000",
+    accent: "#1a1a1e",
+    stats: { speed: 10, accel: 10, brakes: 9, cornering: 9, aura: 10 },
+    blurb: "HYBRID HYPERCAR. MARANELLO'S FINEST.",
+    shape: "wedge",
+  },
+  {
+    id: "p1",
+    name: "MCLAREN P1",
+    tier: "S",
+    color: "#3d3d3d",
+    accent: "#7fff00",
+    stats: { speed: 10, accel: 10, brakes: 10, cornering: 9, aura: 9 },
+    blurb: "ACTIVE AERO. HYBRID BEAST.",
+    shape: "wedge",
+  },
 ];
 
 export function carById(id) {
   return CARS.find((c) => c.id === id) || CARS[0];
 }
 
-/** stats (0-10) -> physics params; tuned so the fastest B-tier hits ~160 km/h */
+/** 
+ * stats (0-10) -> physics params
+ * Balanced tiers - each tier is fun but higher is clearly better:
+ * C: top ~140 km/h, corner ~90 km/h
+ * B: top ~180 km/h, corner ~120 km/h
+ * A: top ~240 km/h, corner ~170 km/h
+ * S: top ~300 km/h, corner ~220 km/h
+ */
 export function physFor(def) {
   const s = def.stats;
+  const tier = def.tier || "B";
+  
+  // Top speed (m/s) - clear progression
+  const tierTopSpeed = { C: 39, B: 50, A: 67, S: 83 };
+  const baseTop = tierTopSpeed[tier] || 50;
+  const topSpeed = baseTop * (0.9 + s.speed * 0.012);
+  
+  // Acceleration - C feels slow, S feels fast, all are playable
+  const tierAccel = { C: 7, B: 10, A: 14, S: 20 };
+  const engine = (tierAccel[tier] || 10) * (0.85 + s.accel * 0.018);
+  
+  // Braking - scales with tier, all adequate
+  const tierBrake = { C: 30, B: 35, A: 42, S: 50 };
+  const brake = (tierBrake[tier] || 35) * (0.88 + s.brakes * 0.014);
+  
+  // Grip - more downforce = more grip. S tier sticks hard
+  const tierGrip = { C: 7, B: 9, A: 12, S: 16 };
+  const grip = (tierGrip[tier] || 9) * (0.9 + s.cornering * 0.012);
+  
+  // Steering - S tier is razor sharp
+  const tierSteer = { C: 2.0, B: 2.4, A: 2.9, S: 3.6 };
+  const steer = (tierSteer[tier] || 2.4) * (0.9 + s.cornering * 0.012);
+  
+  // Max safe cornering speed (km/h) - balanced per tier
+  const tierCornerSpeed = { C: 90, B: 120, A: 170, S: 220 };
+  const maxCornerSpeed = (tierCornerSpeed[tier] || 120) * (0.92 + s.cornering * 0.01);
+  
   return {
-    topSpeed: 26 + s.speed * 2.3,          // m/s: 8 -> 44.4 (160 km/h)
-    engine: 9 + s.accel * 1.8,             // forward accel m/s^2
-    brake: 24 + s.brakes * 2.6,
-    grip: 8.2 + s.cornering * 0.5,         // lateral grip
-    steer: 2.25 + s.cornering * 0.09,      // steering gain
+    topSpeed,
+    engine,
+    brake,
+    grip,
+    steer,
+    maxCornerSpeed,
     aura: s.aura,
+    tier,
   };
 }
 
-import { SPRITE_PPM, drawCarBase, drawGlass, drawLights } from "./car.js";
-
 /** distinct pixel cars per shape on the shared chassis; front = top */
 export function makeCarSpriteFor(def, scale = 1) {
+  const png = getCachedSprite(def.id);
+  if (png) {
+    const base = imageToCanvas(png);
+    if (scale === 1) return base;
+    const c = document.createElement("canvas");
+    c.width = Math.round(base.width * scale);
+    c.height = Math.round(base.height * scale);
+    const g = c.getContext("2d");
+    g.imageSmoothingEnabled = false;
+    g.drawImage(base, 0, 0, c.width, c.height);
+    return c;
+  }
+
   const Lm = 4.5, Wm = 2.1;
   const c = document.createElement("canvas");
   c.width = Math.round(Wm * SPRITE_PPM * scale);

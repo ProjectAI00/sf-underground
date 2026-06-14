@@ -1,6 +1,6 @@
 // Whole-SF processor: raw Overpass dumps -> 1km chunk files + overview.json.
 // Run: node --max-old-space-size=8192 tools/process_sf.mjs
-import { readFileSync, writeFileSync, mkdirSync, rmSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync, rmSync, existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
@@ -29,13 +29,20 @@ const ROAD_RANK = {
 };
 
 function loadRaw(name) {
-  return JSON.parse(readFileSync(join(RAW, name + ".json"), "utf8")).elements;
+  const path = join(RAW, name + ".json");
+  if (!existsSync(path)) {
+    console.log(`  (${name}.json not found, skipping)`);
+    return [];
+  }
+  return JSON.parse(readFileSync(path, "utf8")).elements || [];
 }
+
 function projectWay(el) {
   const p = [];
   for (const g of el.geometry) p.push(px(g.lon), py(g.lat));
   return p;
 }
+
 function polyLen(p) {
   let L = 0;
   for (let i = 0; i + 3 < p.length; i += 2) L += Math.hypot(p[i + 2] - p[i], p[i + 3] - p[i + 1]);
@@ -56,6 +63,8 @@ for (const el of loadRaw("roads")) {
   const base = {
     w: ROAD_W[hw], r: ROAD_RANK[hw], n: el.tags.name || "",
     ow: el.tags.oneway === "yes" ? 1 : 0,
+    tu: el.tags.tunnel === "yes" ? 1 : 0,
+    br: el.tags.bridge === "yes" ? 1 : 0,
   };
   fullRoads.push({ ...base, p });
   // chop
@@ -74,7 +83,7 @@ for (const el of loadRaw("roads")) {
 }
 console.log(`  ${roads.length} road pieces (${fullRoads.length} ways)`);
 
-// segment grid for nearest-road lookups (signals/crossings placement)
+// segment grid for nearest-road lookups
 const segGrid = new Map();
 const SEG_CELL = 50;
 roads.forEach((r, idx) => {
@@ -90,6 +99,7 @@ roads.forEach((r, idx) => {
     }
   }
 });
+
 function nearestRoad(x, y, maxD = 25) {
   let best = null;
   const c0x = Math.floor(x / SEG_CELL), c0y = Math.floor(y / SEG_CELL);
@@ -126,7 +136,73 @@ for (const el of loadRaw("land")) {
   else if (t.natural === "sand" || t.natural === "beach") sand.push(p);
   else parks.push(p);
 }
+// Also load dedicated water.json
+for (const el of loadRaw("water")) {
+  if (el.type !== "way" || !el.geometry) continue;
+  const p = projectWay(el);
+  if (p.length < 6) continue;
+  water.push(p);
+}
 console.log(`  parks=${parks.length} water=${water.length} sand=${sand.length}`);
+
+// ---------- parking ----------
+console.log("parking...");
+const parking = [];
+for (const el of loadRaw("parking")) {
+  if (el.type !== "way" || !el.geometry) continue;
+  const p = projectWay(el);
+  if (p.length < 6) continue;
+  parking.push(p);
+}
+console.log(`  parking=${parking.length}`);
+
+// ---------- waterfront (piers, marinas) ----------
+console.log("waterfront...");
+const piers = [];
+for (const el of loadRaw("waterfront")) {
+  if (el.type !== "way" || !el.geometry) continue;
+  const p = projectWay(el);
+  if (p.length < 4) continue;
+  piers.push(p);
+}
+console.log(`  piers/docks=${piers.length}`);
+
+// ---------- zones (commercial, industrial, retail) ----------
+console.log("zones...");
+const commercial = [], industrial = [], retail = [];
+for (const el of loadRaw("zones")) {
+  if (el.type !== "way" || !el.geometry) continue;
+  const t = el.tags || {};
+  const p = projectWay(el);
+  if (p.length < 6) continue;
+  if (t.landuse === "retail") retail.push(p);
+  else if (t.landuse === "industrial") industrial.push(p);
+  else commercial.push(p);
+}
+console.log(`  commercial=${commercial.length} industrial=${industrial.length} retail=${retail.length}`);
+
+// ---------- railways ----------
+console.log("railways...");
+const railways = [];
+for (const el of loadRaw("railways")) {
+  if (el.type !== "way" || !el.geometry) continue;
+  const p = projectWay(el);
+  if (p.length < 4) continue;
+  const t = el.tags || {};
+  railways.push({ p, type: t.railway || "rail" });
+}
+console.log(`  railways=${railways.length}`);
+
+// ---------- pedestrian areas ----------
+console.log("pedestrian...");
+const plazas = [];
+for (const el of loadRaw("pedestrian")) {
+  if (el.type !== "way" || !el.geometry) continue;
+  const p = projectWay(el);
+  if (p.length < 6) continue;
+  plazas.push(p);
+}
+console.log(`  plazas=${plazas.length}`);
 
 // ---------- buildings ----------
 console.log("buildings...");
@@ -141,9 +217,6 @@ function pointInPoly(p, x, y) {
   return inside;
 }
 
-// true when the footprint covers drivable road centerline (stations, bridge
-// structures, parking decks, mis-mapped blocks) — those break rendering AND
-// would wall off the street, so we drop them
 function coversRoad(p) {
   let x1 = Infinity, y1 = Infinity, x2 = -Infinity, y2 = -Infinity;
   for (let i = 0; i < p.length; i += 2) {
@@ -152,30 +225,15 @@ function coversRoad(p) {
     if (p[i + 1] < y1) y1 = p[i + 1];
     if (p[i + 1] > y2) y2 = p[i + 1];
   }
-  const seen = new Set();
-  let hits = 0;
-  const cx1 = Math.floor(x1 / SEG_CELL), cx2 = Math.floor(x2 / SEG_CELL);
-  const cy1 = Math.floor(y1 / SEG_CELL), cy2 = Math.floor(y2 / SEG_CELL);
-  for (let cx = cx1; cx <= cx2; cx++) {
-    for (let cy = cy1; cy <= cy2; cy++) {
-      const arr = segGrid.get(cx + "," + cy);
-      if (!arr) continue;
-      for (const [idx, s] of arr) {
-        const key = idx * 10000 + s;
-        if (seen.has(key)) continue;
-        seen.add(key);
-        const road = roads[idx];
-        if (road.r < 1) continue;
-        const q = road.p;
-        const sx = q[s], sy = q[s + 1], ex = q[s + 2], ey = q[s + 3];
-        const segLen = Math.hypot(ex - sx, ey - sy);
-        const steps = Math.max(1, Math.ceil(segLen / 6));
-        for (let k = 0; k <= steps; k++) {
-          const px2 = sx + ((ex - sx) * k) / steps;
-          const py2 = sy + ((ey - sy) * k) / steps;
-          if (px2 < x1 || px2 > x2 || py2 < y1 || py2 > y2) continue;
-          if (pointInPoly(p, px2, py2) && ++hits >= 3) return true;
-        }
+  const cx = Math.floor((x1 + x2) / 2 / SEG_CELL), cy = Math.floor((y1 + y2) / 2 / SEG_CELL);
+  for (let dx = -1; dx <= 1; dx++) for (let dy = -1; dy <= 1; dy++) {
+    const a = segGrid.get((cx + dx) + "," + (cy + dy));
+    if (!a) continue;
+    for (const [idx] of a) {
+      const rp = roads[idx].p;
+      for (let i = 0; i + 3 < rp.length; i += 2) {
+        const rx = (rp[i] + rp[i + 2]) / 2, ry = (rp[i + 1] + rp[i + 3]) / 2;
+        if (rx >= x1 && rx <= x2 && ry >= y1 && ry <= y2 && pointInPoly(p, rx, ry)) return true;
       }
     }
   }
@@ -183,20 +241,22 @@ function coversRoad(p) {
 }
 
 const buildings = [];
-const seenB = new Set();
-let bid = 0;
-let droppedOverRoad = 0;
+let droppedOverRoad = 0, bid = 0;
 for (const name of ["buildings_w", "buildings_e"]) {
   for (const el of loadRaw(name)) {
-    if (el.type !== "way" || !el.geometry || seenB.has(el.id)) continue;
-    seenB.add(el.id);
+    if (el.type !== "way" || !el.geometry) continue;
     const p = projectWay(el);
     if (p.length < 6) continue;
-    const t = el.tags || {};
     if (coversRoad(p)) { droppedOverRoad++; continue; }
-    const lv = parseFloat(t["building:levels"]) || (t.building === "house" ? 2 : 2);
-    const kind = /^(industrial|warehouse|hangar|retail|commercial)$/.test(t.building || "") ? 1 : 0;
-    buildings.push({ id: bid++, l: Math.min(lv, 40), k: kind, p });
+    const t = el.tags || {};
+    const levels = parseInt(t["building:levels"]) || (t.building === "house" ? 2 : t.building === "industrial" ? 1 : 3);
+    const kind = t.building === "industrial" || t.building === "warehouse" ? 1 : 0;
+    let x1 = Infinity, y1 = Infinity, x2 = -Infinity, y2 = -Infinity;
+    for (let i = 0; i < p.length; i += 2) {
+      x1 = Math.min(x1, p[i]); x2 = Math.max(x2, p[i]);
+      y1 = Math.min(y1, p[i + 1]); y2 = Math.max(y2, p[i + 1]);
+    }
+    buildings.push({ id: bid++, p, l: levels, k: kind, bbox: [x1, y1, x2, y2] });
   }
 }
 console.log(`  ${buildings.length} buildings (dropped ${droppedOverRoad} spanning roads)`);
@@ -213,9 +273,6 @@ for (const el of loadRaw("nodes")) {
   const near = nearestRoad(x, y, 20);
   if (t.highway === "traffic_signals" || t.highway === "stop") {
     if (!near) continue;
-    // signal nodes sit on the centerline at intersections: move the pole
-    // diagonally to a sidewalk corner (sideways off this road AND backwards
-    // along it, clear of the cross street too)
     const w2 = near.road.w / 2;
     const sideH = ((Math.round(x * 10) + Math.round(y * 10)) & 1) * 2 - 1;
     const backH = ((Math.round(x * 10) ^ Math.round(y * 10)) & 2) - 1;
@@ -226,10 +283,33 @@ for (const el of loadRaw("nodes")) {
     (t.highway === "traffic_signals" ? signals : stops).push(pole);
   } else if (t.highway === "crossing" && t.crossing !== "unmarked") {
     if (!near || near.road.r < 1) continue;
-    crossings.push([x, y, Math.round(Math.atan2(near.ty, near.tx) * 100) / 100, near.road.w]);
+    if (near.d > near.road.w / 2 + 0.35) continue;
+    crossings.push([
+      Math.round(near.cx * 10) / 10,
+      Math.round(near.cy * 10) / 10,
+      Math.round(Math.atan2(near.ty, near.tx) * 100) / 100,
+      near.road.w,
+    ]);
   }
 }
 console.log(`  signals=${signals.length} lamps=${lamps.length} stops=${stops.length} crossings=${crossings.length} trees=${trees.length}`);
+
+// ---------- POIs ----------
+console.log("pois...");
+const pois = [];
+for (const el of loadRaw("pois")) {
+  if (el.type !== "node") continue;
+  const x = px(el.lon), y = py(el.lat);
+  const t = el.tags || {};
+  let type = null;
+  if (t.amenity === "fuel") type = "gas";
+  else if (t.amenity === "fast_food" || t.amenity === "restaurant" || t.amenity === "cafe") type = "food";
+  else if (t.amenity === "bank" || t.amenity === "atm") type = "bank";
+  else if (t.shop) type = "shop";
+  else if (t.tourism) type = "tourism";
+  if (type) pois.push({ x, y, type, name: t.name || "" });
+}
+console.log(`  pois=${pois.length}`);
 
 // ---------- chunking ----------
 console.log("chunking...");
@@ -239,9 +319,15 @@ const chunks = new Map();
 function chunkAt(cx, cy) {
   const k = cx + "_" + cy;
   let c = chunks.get(k);
-  if (!c) chunks.set(k, (c = { roads: [], buildings: [], parks: [], water: [], sand: [], signals: [], lamps: [], stops: [], crossings: [], trees: [] }));
+  if (!c) chunks.set(k, (c = {
+    roads: [], buildings: [], parks: [], water: [], sand: [],
+    parking: [], piers: [], commercial: [], industrial: [], retail: [],
+    railways: [], plazas: [],
+    signals: [], lamps: [], stops: [], crossings: [], trees: [], pois: []
+  }));
   return c;
 }
+
 function bboxOf(p) {
   let x1 = Infinity, y1 = Infinity, x2 = -Infinity, y2 = -Infinity;
   for (let i = 0; i < p.length; i += 2) {
@@ -252,19 +338,31 @@ function bboxOf(p) {
   }
   return [x1, y1, x2, y2];
 }
+
 function addToChunks(p, pad, fn) {
   const [x1, y1, x2, y2] = bboxOf(p);
   const cx1 = Math.floor((x1 - pad) / CHUNK), cx2 = Math.floor((x2 + pad) / CHUNK);
   const cy1 = Math.floor((y1 - pad) / CHUNK), cy2 = Math.floor((y2 + pad) / CHUNK);
   for (let cx = cx1; cx <= cx2; cx++) for (let cy = cy1; cy <= cy2; cy++) fn(chunkAt(cx, cy));
 }
+
+// Add all features to chunks
 for (const r of roads) addToChunks(r.p, r.w, (c) => c.roads.push(r));
 for (const b of buildings) addToChunks(b.p, 2, (c) => c.buildings.push(b));
 for (const p of parks) addToChunks(p, 2, (c) => c.parks.push(p));
 for (const p of water) addToChunks(p, 2, (c) => c.water.push(p));
 for (const p of sand) addToChunks(p, 2, (c) => c.sand.push(p));
+for (const p of parking) addToChunks(p, 2, (c) => c.parking.push(p));
+for (const p of piers) addToChunks(p, 2, (c) => c.piers.push(p));
+for (const p of commercial) addToChunks(p, 2, (c) => c.commercial.push(p));
+for (const p of industrial) addToChunks(p, 2, (c) => c.industrial.push(p));
+for (const p of retail) addToChunks(p, 2, (c) => c.retail.push(p));
+for (const r of railways) addToChunks(r.p, 4, (c) => c.railways.push(r));
+for (const p of plazas) addToChunks(p, 2, (c) => c.plazas.push(p));
+
 const pt = (arr, key) => { for (const n of arr) { const c = chunkAt(Math.floor(n[0] / CHUNK), Math.floor(n[1] / CHUNK)); c[key].push(n); } };
 pt(signals, "signals"); pt(lamps, "lamps"); pt(stops, "stops"); pt(crossings, "crossings"); pt(trees, "trees");
+for (const poi of pois) { const c = chunkAt(Math.floor(poi.x / CHUNK), Math.floor(poi.y / CHUNK)); c.pois.push(poi); }
 
 let totalBytes = 0;
 for (const [k, c] of chunks) {
@@ -276,7 +374,8 @@ console.log(`  ${chunks.size} chunks, ${(totalBytes / 1e6).toFixed(1)} MB total`
 
 // ---------- overview + circuits ----------
 console.log("overview...");
-function simplify(p, eps) { // Douglas-Peucker
+
+function simplify(p, eps) {
   if (p.length <= 4) return p;
   const keep = new Uint8Array(p.length / 2);
   keep[0] = keep[p.length / 2 - 1] = 1;
@@ -313,6 +412,7 @@ function pointAtFrac(p, frac) {
   }
   return { x: p[0], y: p[1], tx: 1, ty: 0 };
 }
+
 function resolve(name, frac) {
   const matches = fullRoads.filter((r) => r.n === name);
   if (!matches.length) { console.log(`  !! street not found: ${name}`); return null; }
@@ -343,24 +443,23 @@ const circuits = CIRCUITS.map((c) => ({
 
 const ovRoads = [];
 for (const r of fullRoads) {
-  if (r.r < 1) continue;
-  // simplify minor roads harder; they're only context lines on the city map
-  ovRoads.push({ r: r.r, p: simplify(r.p, r.r >= 2 ? 6 : 10).map((v) => Math.round(v)) });
+  if (r.r < 2) continue;
+  const p = simplify(r.p, r.r >= 4 ? 8 : 12);
+  if (p.length >= 4) ovRoads.push({ r: r.r, p, n: r.n || undefined });
 }
-let bx1 = Infinity, by1 = Infinity, bx2 = -Infinity, by2 = -Infinity;
+console.log(`  overview roads: ${ovRoads.length}`);
+
+let x1 = Infinity, y1 = Infinity, x2 = -Infinity, y2 = -Infinity;
 for (const r of ovRoads) for (let i = 0; i < r.p.length; i += 2) {
-  if (r.p[i] < bx1) bx1 = r.p[i];
-  if (r.p[i] > bx2) bx2 = r.p[i];
-  if (r.p[i + 1] < by1) by1 = r.p[i + 1];
-  if (r.p[i + 1] > by2) by2 = r.p[i + 1];
+  x1 = Math.min(x1, r.p[i]); x2 = Math.max(x2, r.p[i]);
+  y1 = Math.min(y1, r.p[i + 1]); y2 = Math.max(y2, r.p[i + 1]);
 }
+
 writeFileSync(join(ROOT, "data", "overview.json"), JSON.stringify({
   origin: { lat: LAT0, lon: LON0 },
   chunk: CHUNK,
-  bounds: { minX: bx1, minY: by1, maxX: bx2, maxY: by2 },
+  bounds: { minX: Math.floor(x1), minY: Math.floor(y1), maxX: Math.ceil(x2), maxY: Math.ceil(y2) },
   roads: ovRoads,
   circuits,
 }));
-console.log(`  overview roads=${ovRoads.length}`);
-for (const c of circuits) console.log(`  circuit ${c.id}: ${c.cps.length} checkpoints`);
-console.log("DONE");
+console.log("done.");

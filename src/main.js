@@ -1,6 +1,6 @@
 import { loadWorld } from "./world.js";
 import { Renderer } from "./render.js";
-import { Car } from "./car.js";
+import { Car, drawHeadlightBeams } from "./car.js";
 import { Traffic } from "./traffic.js";
 import { Race } from "./race.js";
 import { Props } from "./props.js";
@@ -8,15 +8,23 @@ import { Peds } from "./peds.js";
 import { Menu } from "./menu.js";
 import { Radar } from "./radar.js";
 import { getLight, applyLight } from "./daynight.js";
+import { updateWeather, applyWeather, cycleWeather, getWeather, setAutoWeather } from "./weather.js";
 import { CARS, carById, physFor, makeCarSpriteFor } from "./cars.js";
+import { preloadAllCarSprites } from "./car-sprites.js";
 import { Lobby } from "./lobby.js";
 import { CityMap } from "./map.js";
-import { MISSIONS, campaignProgress, markBeaten } from "./campaign.js";
-import { Rival } from "./rival.js";
 import { Radio } from "./radio.js";
+import { Multiplayer, makeRoomCode } from "./multiplayer.js";
+import { RemotePlayers } from "./remote-players.js";
+import { elevOffset } from "./terrain.js";
+import { Police } from "./police.js";
+import { SpeedZones } from "./speedzone.js";
+import { Intro, introComplete, resetIntro } from "./intro.js";
 
 const canvas = document.getElementById("game");
 const ctx = canvas.getContext("2d");
+const menuBgCanvas = document.getElementById("menu-bg");
+const menuBgCtx = menuBgCanvas.getContext("2d");
 const ui = {
   speedo: document.querySelector("#speedo .kmh"),
   street: document.getElementById("street"),
@@ -24,15 +32,29 @@ const ui = {
   msg: document.getElementById("msg"),
   clock: document.getElementById("clock"),
   fps: document.getElementById("fps"),
+  wanted: document.getElementById("wanted"),
+  speedwarn: document.getElementById("speedwarn"),
+  bustedBar: document.getElementById("busted-bar"),
+  bustedFill: document.getElementById("busted-bar-fill"),
+  bustedText: document.getElementById("busted-text"),
 };
 
 function resize() {
-  const scale = Math.min(1, 1600 / window.innerWidth);
-  canvas.width = Math.round(window.innerWidth * scale);
-  canvas.height = Math.round(window.innerHeight * scale);
+  canvas.width = window.innerWidth;
+  canvas.height = window.innerHeight;
+  menuBgCanvas.width = Math.round(window.innerWidth * 0.5);
+  menuBgCanvas.height = Math.round(window.innerHeight * 0.5);
 }
 window.addEventListener("resize", resize);
 resize();
+
+// Menu background flyover state
+const menuFlyover = {
+  x: -122.42 * 10000, // Start near downtown SF
+  y: 37.78 * 10000,
+  angle: 0,
+  speed: 15, // m/s
+};
 
 const input = { up: false, down: false, left: false, right: false, brake: false };
 const KEYS = {
@@ -43,28 +65,37 @@ const KEYS = {
   Space: "brake",
 };
 
-let state = "boot"; // boot | lobby | menu | roam | race | paused
+let state = "boot"; // boot | intro | lobby | menu | roam | paused
 let camRotate = true;
-let world, renderer, car, traffic, race, radar, props, peds, menu, lobby, cityMap;
+let world, renderer, car, traffic, race, radar, props, peds, menu, lobby, cityMap, police, speedZones, intro;
 const radio = new Radio();
+let mp = null;
+let remotePlayers = null;
+let mpRoom = null;
 let waypoint = null;
-let rival = null, mission = null;
 let camRot = 0, camZoom = 7.0;
 let shakeT = 0;
+let camLift = 0; // Camera pull-back on acceleration
+let prevSpeed = 0; // For detecting acceleration
+let flyMode = false, flyCam = { x: 0, y: 0, zoom: 3 };
 let frame = 0;
 let profile = null;
 try { profile = JSON.parse(localStorage.getItem("sfracer_profile") || "null"); } catch { /* fresh start */ }
 let fpsVisible = false, fpsFrames = 0, fpsLast = performance.now();
-let timeOverrideIdx = 0; // 0=real, then forced hours for N key
-const TIME_OVERRIDES = [null, 22.5, 20.2, 6.8];
+let timeOverrideIdx = 0; // 0=auto, 1=real, then forced hours for N key
+const TIME_OVERRIDES = ["auto", null, 22.5, 20.2, 6.8, 12, 7];
+const TIME_LABELS = ["AUTO TIME", "REAL SF TIME", "NIGHT", "DUSK", "DAWN", "NOON", "GOLDEN HOUR"];
+globalThis.__forceHour = null; // Start with auto
+let autoTimeHour = 6; // Start at dawn for auto mode
+let autoTimeSpeed = 0.5; // Hours per real minute (30 min = full day cycle)
 
-window.__game = () => ({ world, car, props, traffic, peds, race, rival, cityMap, waypoint });
+window.__game = () => ({ world, car, props, traffic, peds, race, cityMap, waypoint, mp, remotePlayers, police, speedZones, intro });
 window.__go = {
-  race: (id) => startRace(id || world.circuits[0].id),
-  roam: () => { lobby.hide(); freeRoam(); },
-  campaign: (i) => { lobby.hide(); menu.hide(); startCampaign(i ?? 0); },
+  roam: () => { lobby.hide(); startFreeRoam(); },
+  mp: (room) => { lobby.hide(); startMultiplayer(room || makeRoomCode()); },
   wp: (x, y) => { waypoint = x == null ? null : { x, y }; },
 };
+window.__resetIntro = resetIntro; // For testing: call __resetIntro() in console to replay intro
 window.__dbg = () => ({
   state,
   input: { ...input },
@@ -77,7 +108,7 @@ window.addEventListener("keydown", (e) => {
   if (lobby && lobby.visible && lobby.handleKey(e)) return;
   if (cityMap && cityMap.visible && cityMap.handleKey(e)) { e.preventDefault(); return; }
   if (menu && menu.handleKey(e)) { e.preventDefault(); return; }
-  if (e.code === "KeyM" && cityMap && (state === "roam" || state === "race" || state === "paused")) {
+  if (e.code === "KeyM" && cityMap && (state === "roam" || state === "paused")) {
     cityMap.toggle();
     e.preventDefault();
     return;
@@ -95,64 +126,159 @@ window.addEventListener("keydown", (e) => {
 
   if (e.code === "Escape") {
     state = "paused";
-    menu.showPause({ inRace: race.state === "running" || race.state === "countdown" });
+    menu.showPause({ inMultiplayer: Boolean(mp?.connected) });
     return;
   }
   if (e.code === "KeyC") camRotate = !camRotate;
   if (e.code === "KeyR") car.resetToRoad();
   if (e.code === "KeyN") {
     timeOverrideIdx = (timeOverrideIdx + 1) % TIME_OVERRIDES.length;
-    globalThis.__forceHour = TIME_OVERRIDES[timeOverrideIdx] ?? undefined;
-    const labels = ["REAL SF TIME", "NIGHT", "DUSK", "DAWN"];
-    showMsg(labels[timeOverrideIdx], 900, "#4be0c8");
+    const setting = TIME_OVERRIDES[timeOverrideIdx];
+    if (setting === "auto") {
+      globalThis.__forceHour = autoTimeHour; // Use auto cycling time
+    } else if (setting === null) {
+      globalThis.__forceHour = null; // Real SF time
+    } else {
+      globalThis.__forceHour = setting; // Fixed time
+    }
+    showMsg(TIME_LABELS[timeOverrideIdx], 900, "#4be0c8");
+  }
+  if (e.code === "KeyV") {
+    flyMode = !flyMode;
+    if (flyMode) {
+      flyCam = { x: car.x, y: car.y, zoom: 3 };
+      showMsg("FLY CAM - WASD/SCROLL", 1500, "#ff9040");
+    } else {
+      showMsg("NORMAL CAM", 900, "#4be0c8");
+    }
+  }
+  if (e.code === "KeyG") {
+    const weather = getWeather();
+    if (weather.auto) {
+      // Currently auto - switch to manual cycling
+      const newWeather = cycleWeather();
+      const weatherLabels = { clear: "CLEAR", sunny: "SUNNY", cloudy: "CLOUDY", overcast: "OVERCAST", foggy: "FOGGY", rainy: "RAINY", storm: "STORM" };
+      showMsg(weatherLabels[newWeather] || newWeather.toUpperCase(), 900, "#7eb8da");
+    } else {
+      // Currently manual - cycle through, then back to auto
+      const newWeather = cycleWeather();
+      if (newWeather === "clear") {
+        // Wrapped around - enable auto
+        setAutoWeather(true);
+        showMsg("AUTO WEATHER", 900, "#7eb8da");
+      } else {
+        const weatherLabels = { clear: "CLEAR", sunny: "SUNNY", cloudy: "CLOUDY", overcast: "OVERCAST", foggy: "FOGGY", rainy: "RAINY", storm: "STORM" };
+        showMsg(weatherLabels[newWeather] || newWeather.toUpperCase(), 900, "#7eb8da");
+      }
+    }
   }
 });
 window.addEventListener("keyup", (e) => {
   if (KEYS[e.code] !== undefined) input[KEYS[e.code]] = false;
 });
 
+// Fly cam scroll zoom
+window.addEventListener("wheel", (e) => {
+  if (flyMode) {
+    flyCam.zoom *= e.deltaY > 0 ? 0.85 : 1.18;
+    flyCam.zoom = Math.max(0.3, Math.min(10, flyCam.zoom));
+    e.preventDefault();
+  }
+}, { passive: false });
+
 let msgTimer = null;
 function showMsg(text, ms = 1500, color = "#ffc24b") {
+  clearTimeout(msgTimer);
+  ui.msg.style.display = "none";
+  ui.msg.textContent = "";
+  // Force reflow to clear any rendering artifacts
+  void ui.msg.offsetWidth;
   ui.msg.textContent = text;
   ui.msg.style.color = color;
   ui.msg.style.display = "block";
-  clearTimeout(msgTimer);
-  if (ms > 0) msgTimer = setTimeout(() => (ui.msg.style.display = "none"), ms);
+  if (ms > 0) msgTimer = setTimeout(() => {
+    ui.msg.style.display = "none";
+    ui.msg.textContent = "";
+  }, ms);
 }
 
-function fmtTime(t) {
-  const m = Math.floor(t / 60);
-  const s = Math.floor(t % 60);
-  const ms = Math.floor((t * 100) % 100);
-  return `${m}:${String(s).padStart(2, "0")}.${String(ms).padStart(2, "0")}`;
-}
-
-function startRace(circuitId) {
-  const circuit = world.circuits.find((c) => c.id === circuitId);
-  if (!circuit || !circuit.cps.length) return;
-  rival = null; mission = null;
-  race.start(circuit, car);
-  state = "race";
+function leaveMultiplayer() {
+  if (mp) mp.disconnect();
+  mpRoom = null;
+  if (remotePlayers) remotePlayers.clear();
   menu.hide();
-  showMsg("GET READY", 1000);
+  state = "roam";
+  showMsg("LEFT ROOM", 1200, "#ffc24b");
 }
 
-function startCampaign(idx) {
-  mission = MISSIONS[idx];
-  const circuit = world.circuits.find((c) => c.id === mission.circuit) || world.circuits[0];
-  if (!circuit || !circuit.cps.length) return;
-  race.start(circuit, car);
-  rival = new Rival(world, mission, circuit);
-  rival.start();
-  state = "race";
-  menu.hide();
-  showMsg(`${mission.name}: "${mission.taunt}"`, 2600, "#ff8c3c");
-}
-
-function freeRoam() {
+function startFreeRoam() {
+  if (mp) mp.disconnect();
+  mpRoom = null;
+  if (remotePlayers) remotePlayers.clear();
   race.stop();
   state = "roam";
   menu.hide();
+  radio.playSessionPlaylist().catch(() => {});
+}
+
+function handleBusted() {
+  showMsg("BUSTED", 2500, "#ff4f5e");
+  
+  // Stop the car
+  car.vx = 0;
+  car.vy = 0;
+  
+  // Reset wanted level and boxed timer
+  police.setWanted(0);
+  police.resetBoxed();
+  
+  if (race.state === "racing") {
+    // In a race - lose the race
+    race.stop();
+    showMsg("BUSTED - RACE LOST", 3000, "#ff4f5e");
+  } else if (mpRoom) {
+    // In multiplayer - temporarily kicked, respawn after delay
+    showMsg("BUSTED - RESPAWNING...", 2500, "#ff4f5e");
+    setTimeout(() => {
+      // Respawn at a random location away from cops
+      const angle = Math.random() * Math.PI * 2;
+      const dist = 300 + Math.random() * 200;
+      car.x += Math.cos(angle) * dist;
+      car.y += Math.sin(angle) * dist;
+      car.resetToRoad();
+      showMsg("BACK IN ACTION", 1500, "#4be0c8");
+    }, 3000);
+  } else {
+    // Free roam - respawn elsewhere
+    setTimeout(() => {
+      const angle = Math.random() * Math.PI * 2;
+      const dist = 400 + Math.random() * 300;
+      car.x += Math.cos(angle) * dist;
+      car.y += Math.sin(angle) * dist;
+      car.resetToRoad();
+      showMsg("RELEASED", 1200, "#4be0c8");
+    }, 2500);
+  }
+}
+
+function startMultiplayer(roomCode) {
+  const room = roomCode || makeRoomCode();
+  if (mp) mp.disconnect();
+  if (remotePlayers) remotePlayers.clear();
+
+  // Multiplayer always uses real SF time and weather
+  timeOverrideIdx = 0;
+  globalThis.__forceHour = null;
+  globalThis.__weather?.set("clear");
+
+  race.stop();
+  state = "roam";
+  menu.hide();
+  mpRoom = room;
+  radio.playSessionPlaylist().catch(() => {});
+
+  mp.connect(room, profile, { x: car.x, y: car.y, h: car.h });
+  showMsg(`JOINING ${room}...`, 0, "#4be0c8");
 }
 
 function applyProfile() {
@@ -160,9 +286,16 @@ function applyProfile() {
   const def = carById(profile.carId);
   car.phys = physFor(def);
   car.sprite = makeCarSpriteFor(def);
+  if (police) police.setPlayerTier(def.tier);
+}
+
+function hasValidProfile(p) {
+  const tag = String(p?.tag || "").replace(/^@+/, "");
+  return Boolean(p?.carId && tag.length >= 2);
 }
 
 async function init() {
+  try {
   world = await loadWorld();
   renderer = new Renderer(world, canvas);
   race = new Race(world);
@@ -170,45 +303,69 @@ async function init() {
   world.onChunk((cx, cy, chunk) => props.addChunk(cx, cy, chunk));
   traffic = new Traffic(world);
   peds = new Peds(world);
+  police = new Police(world);
+  speedZones = new SpeedZones();
   radar = new Radar(world, document.getElementById("minimap"));
 
-  menu = new Menu({
-    circuits: world.circuits.map((c) => ({ id: c.id, label: c.label })),
-    getBest: (id) => Race.getBest(id),
-    campaign: { missions: MISSIONS, getProgress: campaignProgress },
-    onStartRace: (id) => startRace(id),
-    onStartCampaign: (idx) => startCampaign(idx),
-    onFreeRoam: () => freeRoam(),
-    onResume: () => { state = race.circuit ? "race" : "roam"; menu.hide(); },
-    onRestartRace: () => {
-      if (mission) startCampaign(mission.id);
-      else if (race.circuit) startRace(race.circuit.id);
+  remotePlayers = new RemotePlayers();
+  mp = new Multiplayer({
+    onWelcome: (msg) => {
+      remotePlayers.setSelfId(msg.id);
+      showMsg(`ROOM ${msg.room} · ${msg.roomCount} IN LOBBY`, 2200, "#4be0c8");
     },
-    onQuitToMenu: () => { race.stop(); rival = null; mission = null; state = "menu"; menu.showMain({ loading: false }); },
+    onSnapshot: (players) => remotePlayers.applySnapshot(players),
+    onError: (msg) => {
+      showMsg(msg, 3000, "#ff4f5e");
+      if (!mp.connected) {
+        mpRoom = null;
+        state = "menu";
+        menu.showMultiplayer();
+      }
+    },
+    onDisconnect: () => {
+      if (state === "roam" && mpRoom) {
+        showMsg("DISCONNECTED FROM ROOM", 2500, "#ff4f5e");
+        mpRoom = null;
+        remotePlayers.clear();
+      }
+    },
+  });
+
+  menu = new Menu({
+    onFreeRoam: () => startFreeRoam(),
+    onMultiplayer: (room) => startMultiplayer(room || makeRoomCode()),
+    onResume: () => { state = "roam"; menu.hide(); },
+    onLeaveMultiplayer: () => leaveMultiplayer(),
+    onQuitToMenu: () => {
+      if (mp) mp.disconnect();
+      mpRoom = null;
+      if (remotePlayers) remotePlayers.clear();
+      race.stop();
+      state = "menu";
+      menu.showMain({ loading: false });
+    },
   });
 
   cityMap = new CityMap(world, {
     getPlayer: () => ({ x: car.x, y: car.y, h: car.h }),
     getWaypoint: () => waypoint,
     setWaypoint: (wp) => { waypoint = wp; },
-    getRival: () => (rival ? { x: rival.x, y: rival.y, name: rival.mission.name } : null),
+    teleport: (x, y) => {
+      car.x = x;
+      car.y = y;
+      car.vx = 0;
+      car.vy = 0;
+      showMsg("TELEPORTED", 800, "#4be0c8");
+    },
+    getRival: () => null,
   });
   document.getElementById("minimap").style.cursor = "pointer";
   document.getElementById("minimap").addEventListener("click", () => {
-    if (state === "roam" || state === "race" || state === "paused") cityMap.toggle();
+    if (state === "roam" || state === "paused") cityMap.toggle();
   });
 
   lobby = new Lobby({
     cars: CARS,
-    drawPreview: (canvas, carId) => {
-      const g = canvas.getContext("2d");
-      g.imageSmoothingEnabled = false;
-      g.clearRect(0, 0, canvas.width, canvas.height);
-      const spr = makeCarSpriteFor(carById(carId), 4);
-      const s = Math.min(canvas.width / spr.width, canvas.height / spr.height) * 0.8;
-      g.drawImage(spr, (canvas.width - spr.width * s) / 2, (canvas.height - spr.height * s) / 2,
-        spr.width * s, spr.height * s);
-    },
     profile,
     onComplete: (p) => {
       profile = p;
@@ -219,145 +376,240 @@ async function init() {
       menu.showMain({ loading: false });
     },
   });
+  preloadAllCarSprites(CARS.map((c) => c.id));
   menu.showMain({ loading: true });
 
-  // spawn at the first circuit's start (Grant Avenue, Chinatown)
-  const s = world.circuits[0]?.cps[0] || { x: 0, y: 0, tx: 1, ty: 0 };
-  car = new Car(world, s.x, s.y, Math.atan2(s.ty, s.tx));
+  // Random spawn from interesting locations around SF
+  const SPAWNS = [
+    { x: 2647, y: -3340, h: -1.57 },  // Chinatown
+    { x: 1660, y: -3605, h: 0 },       // Lombard Street
+    { x: 3880, y: -2885, h: 1.57 },    // Ferry Building
+    { x: 2645, y: -2035, h: 0 },       // Union Square
+    { x: -400, y: -126, h: 3.14 },     // Haight
+    { x: 1350, y: 830, h: 0 },         // Mission
+    { x: 2800, y: -680, h: 1.57 },     // SOMA
+    { x: -350, y: -3950, h: 0 },       // Marina
+  ];
+  const s = SPAWNS[Math.floor(Math.random() * SPAWNS.length)];
+  car = new Car(world, s.x, s.y, s.h);
   applyProfile();
   world.update(car.x, car.y);
 
+  // Initialize intro system
+  intro = new Intro(world, canvas);
+
   state = "boot";
   let last = performance.now();
+  let errorCount = 0;
+  let frameBudget = 0;
+  const TARGET_FPS = 60;
+  const FRAME_TIME = 1000 / TARGET_FPS;
+  
   function loop(now) {
-    const dt = Math.min(0.05, (now - last) / 1000);
-    last = now;
-    tick(dt, now);
+    try {
+      const elapsed = now - last;
+      // Skip frame if we're way behind (> 100ms) to catch up
+      if (elapsed > 100) {
+        last = now - FRAME_TIME;
+      }
+      const dt = Math.min(0.033, elapsed / 1000); // cap at ~30fps equivalent dt
+      last = now;
+      tick(dt, now);
+    } catch (err) {
+      errorCount++;
+      console.error("Game loop error:", err);
+      if (errorCount > 10) {
+        console.error("Too many errors, stopping game loop");
+        return;
+      }
+    }
     requestAnimationFrame(loop);
   }
   requestAnimationFrame(loop);
+  } catch (err) {
+    console.error("Retro Racer SF failed to start:", err);
+    const fail = document.createElement("div");
+    fail.style.cssText = "position:fixed;inset:0;z-index:100;display:flex;align-items:center;justify-content:center;padding:24px;background:#0a0a0e;color:#ff4f5e;font:12px/1.8 'Press Start 2P',monospace;text-align:center";
+    fail.innerHTML = `<div><div style="color:#ffc24b;margin-bottom:12px">FAILED TO LOAD</div><div style="color:#e8e0cc;max-width:520px">${err?.message || err}</div><div style="color:#8f8a80;margin-top:16px;font-size:9px">Hard refresh (Cmd+Shift+R)</div></div>`;
+    document.body.appendChild(fail);
+  }
 }
 
 function drawHeadlights(c) {
-  const fx = Math.cos(c.h), fy = Math.sin(c.h);
-  const rx = -fy * 0.8, ry = fx * 0.8;
-  ctx.fillStyle = "rgba(255,240,190,0.22)";
-  for (const s of [-1, 1]) {
-    const bx = c.x + fx * 2 + rx * s, by = c.y + fy * 2 + ry * s;
-    ctx.beginPath();
-    ctx.moveTo(bx, by);
-    ctx.lineTo(bx + fx * 13 + rx * s * 3.4, by + fy * 13 + ry * s * 3.4);
-    ctx.lineTo(bx + fx * 13 - rx * s * 1.2, by + fy * 13 - ry * s * 1.2);
-    ctx.closePath();
-    ctx.fill();
-  }
+  drawHeadlightBeams(ctx, c.x, c.visualY(), c.h, 1);
 }
 
 function tick(dt, now) {
   frame++;
-  world.update(car.x, car.y);
+  // Update world around player (or intro camera target)
+  const worldTarget = (state === "intro" && intro?.getCameraTarget()) || car;
+  world.update(worldTarget.x, worldTarget.y);
+  updateWeather(dt, car?.speed() || 0);
+  
+  // Auto time cycling (when in auto mode)
+  if (TIME_OVERRIDES[timeOverrideIdx] === "auto") {
+    autoTimeHour += (dt / 60) * autoTimeSpeed; // Convert dt to minutes, then apply speed
+    if (autoTimeHour >= 24) autoTimeHour -= 24;
+    globalThis.__forceHour = autoTimeHour;
+  }
 
   if (state === "boot") {
     if (world.ready(car.x, car.y, 350)) {
-      menu.hide();
+      // Check if intro needs to play
+      if (!introComplete()) {
+        menu.hide();
+        state = "intro";
+        intro.start(car);
+      } else {
+        // Skip to lobby (name + car pick)
+        menu.hide();
+        state = "lobby";
+        lobby.show();
+      }
+    }
+  }
+  
+  // Handle intro state
+  if (state === "intro") {
+    intro.update(dt, input);
+    if (intro.isComplete()) {
       state = "lobby";
       lobby.show();
     }
   }
 
   const light = getLight();
-  const paused = state === "paused" || state === "menu" || state === "boot" || state === "lobby";
-  const racing = state === "race";
-  const frozen = racing && race.state === "countdown";
+  const introWithControl = state === "intro" && intro.hasPlayerControl();
+  const paused = state === "paused" || state === "menu" || state === "boot" || state === "lobby" || (state === "intro" && !intro.hasPlayerControl());
+  const roaming = (state === "roam" && !menu.visible) || introWithControl;
 
-  if (!paused) {
-    const liveInput = frozen ? { up: false, down: false, left: false, right: false, brake: false } : input;
-    car.update(dt, liveInput);
-    traffic.update(dt, car);
+  // View radius for simulation (cam not built yet — use camZoom)
+  // Generous radius so traffic/props are already spawned before you arrive
+  const updateViewR = Math.hypot(canvas.width, canvas.height) / 2 / camZoom + Math.min(280, car.speed() * 3.5);
+
+  if (!paused && roaming) {
+    car.update(dt, input);
+    traffic.update(dt, car, updateViewR);
+    const pedHitsBefore = peds.hitCount;
     peds.update(dt, car);
     props.knockCheck(car, dt);
-
-    if (racing) {
-      const ev = race.update(dt, car);
-      if (ev?.type === "checkpoint") showMsg("CHECKPOINT", 700, "#4be0c8");
-      if (ev?.type === "go") showMsg("GO!", 800, "#4be0c8");
-      if (ev?.type === "finish") {
-        if (rival && mission) {
-          if (rival.finished) {
-            showMsg(`${mission.name} ALREADY FINISHED — REMATCH?`, 4000, "#ff4f5e");
-          } else {
-            markBeaten(mission.id);
-            const done = campaignProgress() >= MISSIONS.length;
-            showMsg(done ? "CAMPAIGN COMPLETE. TECH HAS FALLEN." : `YOU BEAT ${mission.name}!  ${fmtTime(race.time)}`, 5000, "#4be0c8");
-          }
-          rival = null; mission = null;
-        } else {
-          showMsg(ev.isBest ? `NEW RECORD  ${fmtTime(race.time)}` : `FINISH  ${fmtTime(race.time)}`, 4000);
-        }
-        state = "roam";
+    
+    // Disable police during intro
+    if (state !== "intro") {
+      speedZones.update(dt, car, police);
+      police.update(dt, car, traffic, speedZones);
+      police.checkCollisions(car, traffic, dt);
+      
+      const boxedStatus = police.updateBoxedStatus(dt, car);
+      if (boxedStatus === "busted") {
+        handleBusted();
       }
-      if (race.state === "countdown") {
-        const n = Math.ceil(race.countdown);
-        showMsg(race.countdown > 3 ? "GET READY" : String(Math.max(1, n)), 0, "#ffc24b");
-      }
-
-      if (rival && race.state === "running") {
-        const t = race.target();
-        const playerProg = t ? { cp: race.cpIndex, dist: Math.hypot(t.x - car.x, t.y - car.y) } : null;
-        rival.update(dt, car, playerProg);
-        if (rival.finished && mission) {
-          showMsg(`${mission.name} WINS. "${mission.taunt}"`, 5000, "#ff4f5e");
-          race.stop();
-          rival = null; mission = null;
-          state = "roam";
-        }
+      
+      if (peds.hitCount > pedHitsBefore) {
+        police.addWanted(1);
       }
     }
+    if (mp) mp.update(dt, car);
+    if (remotePlayers) remotePlayers.update(dt);
   }
 
   // camera
-  const targetRot = camRotate ? car.h + Math.PI / 2 : 0;
-  let dr = targetRot - camRot;
-  while (dr > Math.PI) dr -= 2 * Math.PI;
-  while (dr < -Math.PI) dr += 2 * Math.PI;
-  camRot += dr * Math.min(1, 3.2 * dt);
-  const targetZoom = 7.2 - Math.min(3.0, car.speed() / 21);
-  camZoom += (targetZoom - camZoom) * Math.min(1, 1.8 * dt);
-  if (car.crashT > 0.2) shakeT = 0.25;
-  if (car.bumpT > 0.08) shakeT = Math.max(shakeT, 0.08);
-  shakeT = Math.max(0, shakeT - dt);
+  let cam;
+  const camTarget = (state === "intro" && intro.getCameraTarget()) ? intro.getCameraTarget() : car;
+  const spd = Math.hypot(camTarget.vx || 0, camTarget.vy || 0);
+  
+  if (flyMode) {
+    // Fly camera mode - WASD to move, scroll to zoom
+    const flySpeed = 800 / flyCam.zoom; // Faster when zoomed out
+    if (input.up) flyCam.y -= flySpeed * dt;
+    if (input.down) flyCam.y += flySpeed * dt;
+    if (input.left) flyCam.x -= flySpeed * dt;
+    if (input.right) flyCam.x += flySpeed * dt;
+    world.update(flyCam.x, flyCam.y); // Load chunks around fly cam
+    cam = { x: flyCam.x, y: flyCam.y, zoom: flyCam.zoom * (canvas.width / 1600), rot: 0 };
+  } else {
+    const targetRot = camRotate ? camTarget.h + Math.PI / 2 : 0;
+    let dr = targetRot - camRot;
+    while (dr > Math.PI) dr -= 2 * Math.PI;
+    while (dr < -Math.PI) dr += 2 * Math.PI;
+    camRot += dr * Math.min(1, 3.2 * dt);
+    
+    // Zoom - zoomed in when slow, pulls back more at high speed
+    const spdKmh = spd * 3.6;
+    // Base zoom 12 when stopped, drops to ~9.5 at high speed
+    const targetZoom = spdKmh < 30 ? 12 - spdKmh / 60 : 11.5 - Math.min(2, (spdKmh - 30) / 120);
+    camZoom += (targetZoom - camZoom) * Math.min(1, 2.5 * dt);
+    
+    // Minimal camera lift
+    const accel = (spd - prevSpeed) / dt;
+    prevSpeed = spd;
+    const targetLift = accel > 15 ? Math.min(0.4, accel * 0.02) : 0;
+    camLift += (targetLift - camLift) * Math.min(1, 3 * dt);
+    
+    if (car.crashT > 0.2) shakeT = 0.15;
+    if (car.bumpT > 0.08) shakeT = Math.max(shakeT, 0.04);
+    shakeT = Math.max(0, shakeT - dt);
 
-  const lookAhead = Math.min(26, car.speed() * 0.5);
-  const lookX = Math.cos(car.h) * lookAhead;
-  const lookY = Math.sin(car.h) * lookAhead;
-  const shake = shakeT > 0 ? shakeT * 4 : 0;
-  const cam = {
-    x: car.x + lookX + (Math.random() - 0.5) * shake,
-    y: car.y + lookY + (Math.random() - 0.5) * shake,
-    zoom: camZoom * (canvas.width / 1600),
-    rot: camRot,
-  };
+    // Minimal look-ahead to reduce tile thrashing at speed
+    const lookAhead = Math.min(10, spd * 0.18);
+    const lookX = Math.cos(camTarget.h) * lookAhead;
+    const lookY = Math.sin(camTarget.h) * lookAhead;
+    const grade = car.grade || 0;
+    const hillCam = grade * 1.5;
+    const shake = shakeT > 0 ? shakeT * 2 : 0;
+    const camTargetVisualY = camTarget.y + elevOffset(camTarget.x, camTarget.y);
+    const liftBack = camLift * 0.5;
+    cam = {
+      x: camTarget.x + lookX - lookX * hillCam * 0.02 - Math.cos(camTarget.h) * liftBack + (Math.random() - 0.5) * shake,
+      y: camTargetVisualY + lookY - lookY * hillCam * 0.02 - Math.sin(camTarget.h) * liftBack + (Math.random() - 0.5) * shake,
+      zoom: (camZoom - camLift * 0.08) * (canvas.width / 1600) * (1 - grade * 0.005),
+      rot: camRot,
+    };
+  }
 
   // --- draw ---
   renderer.drawWorld(cam);
   car.drawSkids(ctx);
-  if (racing) race.drawWorld(ctx, frame);
-  const viewR = Math.hypot(canvas.width, canvas.height) / 2 / cam.zoom;
+  const baseViewR = Math.hypot(canvas.width, canvas.height) / 2 / cam.zoom;
+  const viewR = baseViewR + Math.min(150, spd * 2);
   if (light.headlights) drawHeadlights(car);
-  traffic.draw(ctx, cam.x, cam.y, viewR, light);
-  peds.draw(ctx, cam.x, cam.y, viewR);
-  if (rival) rival.draw(ctx, cam.x, cam.y, viewR);
-  car.draw(ctx);
+  police.drawSpotlight(ctx, car);
+  traffic.draw(ctx, cam.x, cam.y, viewR + 100, light, car);
+  police.draw(ctx, cam.x, cam.y, viewR + 100, light);
+  if (spd < 55) peds.draw(ctx, cam.x, cam.y, viewR);
+  if (remotePlayers && mp?.connected) remotePlayers.draw(ctx, cam.x, cam.y, viewR);
+  // During intro, the intro system draws the Tesla - don't draw player's car
+  if (state === "intro") {
+    intro.draw(ctx, cam);
+  } else {
+    car.draw(ctx);
+  }
   car.drawFx(ctx);
   renderer.drawBuildings(cam, viewR + 30);
-  props.draw(ctx, cam, viewR + 10, now / 1000, light);
+  police.drawHelicopter(ctx, cam.x, cam.y);
+  props.draw(ctx, cam, viewR + 40, now / 1000, light, spd);
   renderer.end();
 
   applyLight(ctx, canvas, light);
+  applyWeather(ctx, canvas, light);
+  
+  // Speed vignette - dark edges when going fast (only when driving, not in menu)
+  const spdKmhVignette = spd * 3.6;
+  if (!paused && !flyMode && spdKmhVignette > 100) {
+    const intensity = Math.min(0.5, (spdKmhVignette - 100) / 200);
+    const cx = canvas.width / 2;
+    const cy = canvas.height / 2;
+    const innerR = Math.min(cx, cy) * 0.7;
+    const outerR = Math.hypot(cx, cy);
+    const vignette = ctx.createRadialGradient(cx, cy, innerR, cx, cy, outerR);
+    vignette.addColorStop(0, "rgba(0,0,0,0)");
+    vignette.addColorStop(0.5, `rgba(0,0,0,${intensity * 0.3})`);
+    vignette.addColorStop(1, `rgba(0,0,0,${intensity})`);
+    ctx.fillStyle = vignette;
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+  }
 
-  if (racing && race.state === "running") race.drawArrow(ctx, canvas, car, camRot);
-
-  // waypoint guidance (amber, below the race arrow)
+  // waypoint guidance
   if (waypoint && !paused) {
     const wd = Math.hypot(waypoint.x - car.x, waypoint.y - car.y);
     if (wd < 30) {
@@ -365,7 +617,7 @@ function tick(dt, now) {
       waypoint = null;
     } else {
       const ang = Math.atan2(waypoint.y - car.y, waypoint.x - car.x) - camRot;
-      const wx = canvas.width / 2, wy = racing ? 150 : 86;
+      const wx = canvas.width / 2, wy = 86;
       ctx.save();
       ctx.translate(wx, wy);
       ctx.rotate(ang + Math.PI / 2);
@@ -381,14 +633,68 @@ function tick(dt, now) {
       ctx.fill();
       ctx.stroke();
       ctx.restore();
+      const distText = wd >= 1000 ? (wd / 1000).toFixed(1) + "km" : Math.round(wd) + "m";
       ctx.font = '9px "Press Start 2P", monospace';
       ctx.textAlign = "center";
+      ctx.textBaseline = "top";
+      // Background for text
+      const textWidth = ctx.measureText(distText).width;
+      ctx.fillStyle = "rgba(0,0,0,0.6)";
+      ctx.fillRect(wx - textWidth / 2 - 4, wy + 18, textWidth + 8, 16);
       ctx.fillStyle = "#ffc24b";
-      ctx.fillText(wd >= 1000 ? (wd / 1000).toFixed(1) + "km" : Math.round(wd) + "m", wx, wy + 26);
+      ctx.fillText(distText, wx, wy + 20);
     }
   }
 
+  // --- MENU BACKGROUND FLYOVER ---
+  const showMenuBg = state === "menu" || state === "boot" || state === "lobby" || (menu && menu.visible);
+  menuBgCanvas.classList.toggle("visible", showMenuBg);
+  if (showMenuBg && renderer) {
+    // Update flyover position - slow circular path over the city
+    menuFlyover.angle += dt * 0.08;
+    const cx = -122.41 * 10000, cy = 37.78 * 10000; // Downtown SF center
+    const radius = 800; // Circle radius in meters
+    menuFlyover.x = cx + Math.cos(menuFlyover.angle) * radius;
+    menuFlyover.y = cy + Math.sin(menuFlyover.angle) * radius;
+    
+    // Render city view to menu background
+    const flyoverCam = {
+      x: menuFlyover.x,
+      y: menuFlyover.y,
+      zoom: 3.5 * (menuBgCanvas.width / 1600), // Zoomed out view
+      rot: menuFlyover.angle + Math.PI / 2, // Face direction of travel
+    };
+    
+    // Draw to menu background canvas
+    const oldCtx = renderer.ctx;
+    renderer.ctx = menuBgCtx;
+    menuBgCtx.fillStyle = "#0a0a0e";
+    menuBgCtx.fillRect(0, 0, menuBgCanvas.width, menuBgCanvas.height);
+    renderer.drawWorld(flyoverCam);
+    const flyViewR = Math.hypot(menuBgCanvas.width, menuBgCanvas.height) / 2 / flyoverCam.zoom;
+    renderer.drawBuildings(flyoverCam, flyViewR + 50);
+    renderer.end();
+    renderer.ctx = oldCtx;
+  }
+
   // --- HUD ---
+  const introTutorial = state === "intro" && intro.hasPlayerControl();
+  const uiVisible = state === "roam" || state === "paused" || introTutorial;
+  for (const el of document.querySelectorAll(".hud, #crt, #vignette, #radio")) {
+    el.style.visibility = uiVisible ? "visible" : "hidden";
+  }
+  // During intro tutorial, show minimal HUD but skip the rest
+  if (!uiVisible) return;
+  if (introTutorial) {
+    // Show speedo, street name, and minimap during tutorial
+    ui.speedo.textContent = car.kmh();
+    const nearRoad = world.nearestRoad(car.x, car.y, 60);
+    ui.street.textContent = nearRoad && nearRoad.road.n ? nearRoad.road.n.toUpperCase() : "";
+    ui.racehud.innerHTML = `<span class="dim">TUTORIAL</span>`;
+    radar.draw(car, race, camRot, intro.getWaypoint(), null, police, speedZones);
+    return;
+  }
+
   ui.speedo.textContent = car.kmh();
   const near = world.nearestRoad(car.x, car.y, 60);
   ui.street.textContent = near && near.road.n ? near.road.n.toUpperCase() : "";
@@ -401,28 +707,48 @@ function tick(dt, now) {
     fpsFrames = 0;
     fpsLast = fnow;
   }
-  if (racing) {
-    const total = race.checkpoints.length;
-    const cp = Math.min(race.cpIndex, total);
-    let posLine = `<span class="dim">BEST ${race.best ? fmtTime(race.best) : "--:--"}</span>`;
-    if (rival) {
-      const rp = rival.progress();
-      const t = race.target();
-      const myDist = t ? Math.hypot(t.x - car.x, t.y - car.y) : 0;
-      const ahead = race.cpIndex > rp.cp || (race.cpIndex === rp.cp && myDist < rp.dist);
-      posLine = `<span style="color:${ahead ? "#4be0c8" : "#ff4f5e"}">POS ${ahead ? 1 : 2}/2</span> ` +
-        `<span class="dim">VS ${rival.mission.name}</span>`;
+  if (roaming) {
+    if (mp?.connected && mpRoom) {
+      const near = remotePlayers?.nearbyCount() ?? 0;
+      ui.racehud.innerHTML =
+        `<span class="dim">MULTIPLAYER &mdash; ${mpRoom}</span><br>` +
+        `<span>${near} NEARBY &middot; ${mp.roomCount} IN ROOM</span>`;
+    } else {
+      ui.racehud.innerHTML = `<span class="dim">FREE ROAM &mdash; ESC FOR MENU</span>`;
     }
-    ui.racehud.innerHTML =
-      `<span class="big">${fmtTime(race.time)}</span><br>` +
-      `<span>CP ${cp}/${total}</span><br>` + posLine;
-  } else if (state === "roam") {
-    ui.racehud.innerHTML = `<span class="dim">FREE ROAM &mdash; ESC FOR MENU</span>`;
   } else {
     ui.racehud.innerHTML = "";
   }
 
-  radar.draw(car, race, camRot, waypoint, rival);
+  radar.draw(car, race, camRot, waypoint, null, police, speedZones);
+
+  // Wanted level stars
+  const stars = ui.wanted.querySelectorAll(".star");
+  for (let i = 0; i < stars.length; i++) {
+    stars[i].classList.toggle("active", i < police.wanted);
+  }
+  ui.wanted.classList.toggle("evading", police.evading);
+
+  // Speed zone warning
+  const zone = speedZones.currentZone;
+  const speedKmh = car.speed() * 3.6;
+  if (zone && speedKmh > zone.limit + 5) {
+    ui.speedwarn.textContent = `SPEED LIMIT ${zone.limit} · ${zone.name}`;
+    ui.speedwarn.style.display = "block";
+  } else {
+    ui.speedwarn.style.display = "none";
+  }
+  
+  // Busted progress bar
+  const boxedProgress = police.boxedProgress;
+  if (boxedProgress > 0 && police.wanted > 0) {
+    ui.bustedBar.style.display = "block";
+    ui.bustedText.style.display = "block";
+    ui.bustedFill.style.width = `${boxedProgress * 100}%`;
+  } else {
+    ui.bustedBar.style.display = "none";
+    ui.bustedText.style.display = "none";
+  }
 }
 
 init();

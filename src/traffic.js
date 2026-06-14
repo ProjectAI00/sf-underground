@@ -1,15 +1,36 @@
 // Chunk-streamed ambient traffic around the player. Cars keep only a road
 // reference and arclength, so the active set scales with nearby streets.
 
-import { makeCarSprite, drawCarSprite } from "./car.js";
+import { makeCarSprite, makeWaymoSprite, drawCarSprite, drawHeadlightBeams } from "./car.js";
+import { elevOffset } from "./terrain.js";
 
-const COLORS = ["#c9c3b4", "#5d7a8e", "#8a6f55", "#d9b04a", "#a8443c", "#d9b04a", "#6e7d5a", "#7a5d80"];
-const TARGET_CARS = 70;
-const QUERY_R = 600;
-const DESPAWN_R2 = 750 * 750;
+const COLORS = ["#c9c3b4", "#5d7a8e", "#8a6f55", "#d9b04a", "#a8443c", "#d9b04a", "#6e7d5a", "#7a5d80", "#3a3a42", "#e8e4d8", "#6b4423", "#2d4a5e"];
+const BASE_TARGET_CARS = 50;  // reduced from 90 for performance
+const WAYMO_CHANCE = 0.10;
+let waymoSprite = null;
+
+function getTrafficTarget() {
+  // Intro boost for more cars on road during tutorial
+  if (globalThis.__introTrafficBoost) return Math.floor(BASE_TARGET_CARS * 1.6);
+  
+  const forced = globalThis.__forceHour;
+  const hour = typeof forced === "number" ? forced : new Date().getHours();
+  
+  // Rush hours: 7-9am, 5-7pm = heavy traffic
+  // Night 11pm-5am = light traffic
+  // Midday/evening = moderate
+  if (hour >= 7 && hour < 9) return Math.floor(BASE_TARGET_CARS * 1.5);   // morning rush
+  if (hour >= 17 && hour < 19) return Math.floor(BASE_TARGET_CARS * 1.4); // evening rush
+  if (hour >= 23 || hour < 5) return Math.floor(BASE_TARGET_CARS * 0.3);  // late night
+  if (hour >= 5 && hour < 7) return Math.floor(BASE_TARGET_CARS * 0.5);   // early morning
+  if (hour >= 12 && hour < 14) return Math.floor(BASE_TARGET_CARS * 1.1); // lunch traffic
+  return BASE_TARGET_CARS;
+}
+const QUERY_R = 1000;
+const BASE_DESPAWN_R = 1100;
 const MIN_SPAWN_R2 = 120 * 120;
-const SPAWN_TRIES = 28;
-const SPAWNS_PER_TICK = 4;
+const SPAWN_TRIES = 80;
+const SPAWNS_PER_TICK = 20;
 
 export class Traffic {
   constructor(world) {
@@ -19,11 +40,18 @@ export class Traffic {
     this.tmp = { x: 0, y: 0, tx: 1, ty: 0 };
   }
 
-  update(dt, player) {
+  update(dt, player, viewR = 200) {
+    // Never despawn cars visible on screen - only despawn far outside view
+    // Use generous buffer: at least viewR + 300m or BASE_DESPAWN_R
+    const minDespawnR = Math.max(viewR + 300, BASE_DESPAWN_R);
+    const despawnR2 = minDespawnR * minDespawnR;
+    
     for (let i = this.cars.length - 1; i >= 0; i--) {
       const c = this.cars[i];
       const dx = c.x - player.x, dy = c.y - player.y;
-      if (dx * dx + dy * dy > DESPAWN_R2) this.cars.splice(i, 1);
+      const dist2 = dx * dx + dy * dy;
+      // Only despawn if WELL outside view range
+      if (dist2 > despawnR2) this.cars.splice(i, 1);
     }
 
     this.#spawnNear(player);
@@ -31,6 +59,25 @@ export class Traffic {
 
     for (const c of this.cars) {
       if (c.stopT > 0) c.stopT = Math.max(0, c.stopT - dt);
+      
+      // Waymos are extra cautious - slow down when player is close behind
+      if (c.isWaymo) {
+        const dx = c.x - player.x, dy = c.y - player.y;
+        const dist = Math.hypot(dx, dy);
+        if (dist < 25 && dist > 3) {
+          // Check if player is approaching from behind
+          const playerDir = Math.atan2(player.vy, player.vx);
+          const toCarAngle = Math.atan2(dy, dx);
+          const angleDiff = Math.abs(playerDir - toCarAngle);
+          if (angleDiff < 0.8) {
+            // Player approaching - Waymo slows down dramatically (confused robot)
+            c.v = Math.max(2, c.v * 0.95);
+          }
+        } else if (dist > 40) {
+          // Resume normal speed when player far
+          c.v = Math.min(c.v + dt * 2, c.baseV);
+        }
+      }
 
       c.s += c.v * c.dir * dt;
       if (c.s <= 0 || c.s >= c.len) {
@@ -40,10 +87,11 @@ export class Traffic {
       }
 
       pointAt(c.road.p, c.s, c.pos);
-      const off = c.road.w * 0.22;
+      // Stay in correct lane based on direction (right-hand traffic)
+      const laneOff = c.road.w * 0.22 * c.dir;
       const tx = c.pos.tx * c.dir, ty = c.pos.ty * c.dir;
-      c.x = c.pos.x + -ty * off;
-      c.y = c.pos.y + tx * off;
+      c.x = c.pos.x + -c.pos.ty * laneOff;
+      c.y = c.pos.y + c.pos.tx * laneOff;
       c.h += angDiff(Math.atan2(ty, tx), c.h) * Math.min(1, 8 * dt);
 
       const dx = player.x - c.x, dy = player.y - c.y;
@@ -61,30 +109,47 @@ export class Traffic {
     }
   }
 
-  draw(ctx, camX, camY, viewR, light) {
-    const r2 = viewR * viewR;
+  draw(ctx, camX, camY, viewR, light, player = null) {
+    // Use player position for culling if available (more stable than camera which has shake)
+    const cullX = player?.x ?? camX;
+    const cullY = player?.y ?? camY;
+    // Very generous draw radius - never cull cars that might be visible
+    const drawR = viewR + 100;
+    const r2 = drawR * drawR;
+    
     if (light && light.headlights) {
       ctx.save();
       for (const c of this.cars) {
-        const dx = c.x - camX, dy = c.y - camY;
+        const dx = c.x - cullX, dy = c.y - cullY;
         if (dx * dx + dy * dy <= r2) this.#drawLights(ctx, c);
       }
       ctx.restore();
     }
 
     for (const c of this.cars) {
-      const dx = c.x - camX, dy = c.y - camY;
+      const dx = c.x - cullX, dy = c.y - cullY;
       if (dx * dx + dy * dy > r2) continue;
-      drawCarSprite(ctx, c.sprite, c.x, c.y, c.h, c.stopT > 0);
+      const vy = c.y + elevOffset(c.x, c.y);
+      drawCarSprite(ctx, c.sprite, c.x, vy, c.h, c.stopT > 0, true);
     }
   }
 
   #spawnNear(player) {
-    const need = Math.min(TARGET_CARS - this.cars.length, SPAWNS_PER_TICK);
+    const target = getTrafficTarget();
+    const need = Math.min(target - this.cars.length, SPAWNS_PER_TICK);
     if (need <= 0) return;
 
-    const roads = this.world.roadsNear(player.x, player.y, QUERY_R);
+    // Player velocity for checking spawn path
+    const pSpeed = Math.hypot(player.vx || 0, player.vy || 0);
+    const speedKmh = pSpeed * 3.6;
+    
+    // Increase query radius at high speeds to find roads further out
+    const queryR = speedKmh > 180 ? 1200 : speedKmh > 120 ? 1000 : QUERY_R;
+    const roads = this.world.roadsNear(player.x, player.y, queryR);
     if (!roads || !roads.length) return;
+
+    const pvx = pSpeed > 1 ? player.vx / pSpeed : Math.cos(player.h);
+    const pvy = pSpeed > 1 ? player.vy / pSpeed : Math.sin(player.h);
 
     let spawned = 0;
     for (let tries = 0; spawned < need && tries < SPAWN_TRIES; tries++) {
@@ -98,20 +163,49 @@ export class Traffic {
       const dir = Math.random() < 0.5 ? 1 : -1;
       pointAt(road.p, s, this.tmp);
       const tx = this.tmp.tx * dir, ty = this.tmp.ty * dir;
-      const off = road.w * 0.22;
-      const x = this.tmp.x + -ty * off;
-      const y = this.tmp.y + tx * off;
+      // Each direction stays on its side of the road (right-hand traffic)
+      // dir=1 goes along road direction -> offset to the right (-ty, tx)
+      // dir=-1 goes opposite -> offset to the left (ty, -tx)
+      const laneOff = road.w * 0.22 * dir;
+      const x = this.tmp.x + -this.tmp.ty * laneOff;
+      const y = this.tmp.y + this.tmp.tx * laneOff;
       const dx = x - player.x, dy = y - player.y;
-      if (dx * dx + dy * dy < MIN_SPAWN_R2 && tries + need < SPAWN_TRIES) continue;
+      const dist2 = dx * dx + dy * dy;
+      
+      // Don't spawn too close - scale with player speed
+      // Spawn further out so cars are already there when you arrive
+      const minSpawnDist = speedKmh > 180 ? 280 : speedKmh > 120 ? 200 : 120;
+      if (dist2 < minSpawnDist * minSpawnDist) continue;
+      
+      // CRITICAL: Don't spawn in player's driving path
+      // Check if spawn point is ahead of player and in their lane
+      const dist = Math.sqrt(dist2);
+      const dotAhead = (dx * pvx + dy * pvy) / dist;
+      const aheadDist = dist * dotAhead;
+      
+      // Scale ahead-check distance with speed - at 200km/h need 500m clearance
+      const aheadClearance = speedKmh > 180 ? 500 : speedKmh > 120 ? 400 : 300;
+      const lateralClearance = speedKmh > 180 ? 25 : speedKmh > 120 ? 20 : 15;
+      
+      // If car would spawn ahead of player in their path, skip
+      if (dotAhead > 0.6 && aheadDist < aheadClearance) {
+        const lateralDist = Math.abs(dx * pvy - dy * pvx);
+        if (lateralDist < lateralClearance) continue;
+      }
 
+      const isWaymo = Math.random() < WAYMO_CHANCE;
       const rankBoost = Math.min(3, Math.max(0, road.r || 0) * 0.55);
-      const baseV = Math.min(13, 7 + Math.random() * 3.4 + rankBoost);
+      // Waymos drive slower and more cautiously
+      const baseV = isWaymo 
+        ? Math.min(9, 5 + Math.random() * 2)  // Waymo: slow, cautious
+        : Math.min(13, 7 + Math.random() * 3.4 + rankBoost);
       const spriteIndex = (Math.random() * COLORS.length) | 0;
       const car = {
         road, len, s, dir, x, y,
         h: Math.atan2(ty, tx),
         v: baseV, baseV, stopT: 0,
-        sprite: this.#sprite(spriteIndex),
+        sprite: isWaymo ? this.#waymoSprite() : this.#sprite(spriteIndex),
+        isWaymo,
         pos: { x: this.tmp.x, y: this.tmp.y, tx: this.tmp.tx, ty: this.tmp.ty },
       };
       this.cars.push(car);
@@ -125,30 +219,47 @@ export class Traffic {
     const ex = atStart ? p[0] : p[p.length - 2];
     const ey = atStart ? p[1] : p[p.length - 1];
 
-    const near = this.world.roadsNear(ex, ey, 20);
+    // Search wider radius for connecting roads
+    const near = this.world.roadsNear(ex, ey, 60);
     let next = null, nextAtStart = true, count = 0;
+    let candidates = [];
+    
     for (const r of near) {
       if (!r || r.r < 1 || !r.p || r.p.length < 4) continue;
       const q = r.p;
       const ds = (q[0] - ex) * (q[0] - ex) + (q[1] - ey) * (q[1] - ey);
       const de = (q[q.length - 2] - ex) * (q[q.length - 2] - ex) + (q[q.length - 1] - ey) * (q[q.length - 1] - ey);
-      const connectsStart = ds < 36, connectsEnd = de < 36;
+      
+      // Larger connection threshold (15m = 225 sq)
+      const connectsStart = ds < 225, connectsEnd = de < 225;
       if (!connectsStart && !connectsEnd) continue;
-      if (r === c.road && near.length > 1) continue; // avoid instant U-turn when possible
-      count++;
-      // reservoir-sample one option uniformly
-      if (Math.random() < 1 / count) {
-        next = r;
-        nextAtStart = connectsStart || (connectsStart && connectsEnd && Math.random() < 0.5);
-        if (!connectsStart) nextAtStart = false;
-      }
+      if (r === c.road) continue; // never U-turn on same road
+      
+      // Collect all candidates with their distances
+      const minDist = Math.min(connectsStart ? ds : Infinity, connectsEnd ? de : Infinity);
+      candidates.push({ r, connectsStart, connectsEnd, ds, de, minDist });
     }
-
-    if (!next) { // dead end: turn around
+    
+    if (candidates.length === 0) {
+      // Dead end: turn around
       c.dir *= -1;
       c.s = Math.max(0.1, Math.min(c.len - 0.1, c.s));
       return;
     }
+    
+    // Sort by distance and pick randomly from top candidates (prefer closer but add variety)
+    candidates.sort((a, b) => a.minDist - b.minDist);
+    const pickFrom = Math.min(candidates.length, 3); // pick from top 3 closest
+    const pick = candidates[Math.floor(Math.random() * pickFrom)];
+    
+    next = pick.r;
+    // Determine direction: enter from the end that's closest
+    if (pick.connectsStart && pick.connectsEnd) {
+      nextAtStart = pick.ds <= pick.de || Math.random() < 0.5;
+    } else {
+      nextAtStart = pick.connectsStart;
+    }
+    
     c.road = next;
     c.len = polyLen(next.p);
     if (nextAtStart) { c.s = 0.1; c.dir = 1; }
@@ -177,23 +288,11 @@ export class Traffic {
   }
 
   #drawLights(ctx, c) {
+    const vy = c.y + elevOffset(c.x, c.y);
+    drawHeadlightBeams(ctx, c.x, vy, c.h, 0.72);
     const fx = Math.cos(c.h), fy = Math.sin(c.h);
     const rx = -fy, ry = fx;
-    const frontX = c.x + fx * 2.05, frontY = c.y + fy * 2.05;
-
-    ctx.fillStyle = "rgba(255,236,185,0.10)";
-    for (let side = -1; side <= 1; side += 2) {
-      const sx = frontX + rx * side * 0.62;
-      const sy = frontY + ry * side * 0.62;
-      ctx.beginPath();
-      ctx.moveTo(sx, sy);
-      ctx.lineTo(sx + fx * 7 + rx * side * 0.95, sy + fy * 7 + ry * side * 0.95);
-      ctx.lineTo(sx + fx * 7 - rx * side * 0.25, sy + fy * 7 - ry * side * 0.25);
-      ctx.closePath();
-      ctx.fill();
-    }
-
-    const rearX = c.x - fx * 2.05, rearY = c.y - fy * 2.05;
+    const rearX = c.x - fx * 2.05, rearY = vy - fy * 2.05;
     ctx.fillStyle = "rgba(255,60,48,0.65)";
     ctx.fillRect(rearX + rx * 0.62 - 0.08, rearY + ry * 0.62 - 0.08, 0.16, 0.16);
     ctx.fillRect(rearX - rx * 0.62 - 0.08, rearY - ry * 0.62 - 0.08, 0.16, 0.16);
@@ -202,6 +301,11 @@ export class Traffic {
   #sprite(index) {
     if (!this.sprites) this.sprites = COLORS.map((color) => makeCarSprite(color));
     return this.sprites[index % this.sprites.length];
+  }
+  
+  #waymoSprite() {
+    if (!waymoSprite) waymoSprite = makeWaymoSprite();
+    return waymoSprite;
   }
 }
 

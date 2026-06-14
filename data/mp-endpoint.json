@@ -1,0 +1,4 @@
+{
+  "ws": "ws://34.234.135.117:8787",
+  "note": "Vercel (HTTPS) needs wss:// — run deploy/aws/cloudfront.sh with CloudFront IAM, or localStorage.setItem('sfracer_mp_url', 'wss://YOUR.cloudfront.net')"
+}

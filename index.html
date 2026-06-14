@@ -3,7 +3,8 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>SF UNDERGROUND — Chinatown Circuit</title>
+<title>Retro Racer SF</title>
+<meta name="description" content="Top-down street racing on real San Francisco streets." />
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap" rel="stylesheet" />
 <style>
@@ -16,6 +17,15 @@
   html, body { width: 100%; height: 100%; overflow: hidden; background: #0a0a0e; }
   body { font-family: "Press Start 2P", "Courier New", monospace; color: #f0e8d8; }
   canvas#game { display: block; width: 100vw; height: 100vh; image-rendering: pixelated; }
+  canvas#menu-bg {
+    position: fixed; inset: 0; z-index: 25;
+    width: 100vw; height: 100vh;
+    image-rendering: pixelated;
+    opacity: 0; visibility: hidden;
+    transition: opacity 300ms ease, visibility 300ms ease;
+    filter: brightness(0.15) saturate(0.5);
+  }
+  canvas#menu-bg.visible { opacity: 0.4; visibility: visible; }
 
   /* subtle CRT scanlines */
   #crt {
@@ -39,17 +49,47 @@
   #msg {
     left: 50%; top: 34%; transform: translate(-50%, -50%); text-align: center;
     font-size: 30px; color: var(--amber); display: none; letter-spacing: 2px;
+    text-shadow: 2px 2px 0 #000, -1px -1px 0 #000, 1px -1px 0 #000, -1px 1px 0 #000;
+    padding: 8px 16px;
+    background: rgba(0,0,0,0.5);
+    border-radius: 4px;
   }
   #minimap { left: 24px; bottom: 24px; border-radius: 50%;
     box-shadow: 0 0 0 3px #1c1a16, 0 0 0 5px #5b5345, 0 6px 18px rgba(0,0,0,0.5);
     opacity: 0.94; }
   #clock { right: 24px; top: 20px; font-size: 11px; color: #cfc4ac; }
   #fps { right: 24px; top: 44px; font-size: 10px; color: #4be0c8; display: none; }
+  #wanted { right: 24px; top: 68px; font-size: 14px; letter-spacing: 2px; }
+  #wanted .star { color: #3a3530; }
+  #wanted .star.active { color: #ffc24b; text-shadow: 0 0 8px rgba(255,194,75,0.6); }
+  #wanted.evading .star.active { animation: evade-flash 0.5s infinite; }
+  @keyframes evade-flash { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
+  #speedwarn { left: 50%; top: 60px; transform: translateX(-50%); font-size: 10px; color: #ff5050; display: none; letter-spacing: 1px; }
+  #busted-bar { 
+    left: 50%; top: 100px; transform: translateX(-50%); 
+    width: 200px; height: 8px; 
+    background: rgba(0,0,0,0.6); 
+    border: 2px solid #ff4f5e;
+    border-radius: 4px;
+    display: none;
+  }
+  #busted-bar-fill {
+    height: 100%; width: 0%;
+    background: linear-gradient(90deg, #ff4f5e, #ff2020);
+    border-radius: 2px;
+    transition: width 0.1s linear;
+  }
+  #busted-text {
+    left: 50%; top: 112px; transform: translateX(-50%);
+    font-size: 8px; color: #ff4f5e; letter-spacing: 2px;
+    display: none;
+  }
 </style>
 <link rel="stylesheet" href="src/menu.css" />
 <link rel="stylesheet" href="src/lobby.css" />
 </head>
 <body>
+  <canvas id="menu-bg"></canvas>
   <canvas id="game"></canvas>
   <canvas id="minimap" class="hud" width="190" height="190"></canvas>
   <div id="crt"></div>
@@ -60,6 +100,10 @@
   <div id="racehud" class="hud"></div>
   <div id="clock" class="hud"></div>
   <div id="fps" class="hud"></div>
+  <div id="wanted" class="hud"><span class="star">★</span><span class="star">★</span><span class="star">★</span><span class="star">★</span><span class="star">★</span></div>
+  <div id="speedwarn" class="hud"></div>
+  <div id="busted-bar" class="hud"><div id="busted-bar-fill"></div></div>
+  <div id="busted-text" class="hud">GETTING BOXED IN</div>
   <div id="msg" class="hud"></div>
 
   <script type="module" src="src/main.js"></script>

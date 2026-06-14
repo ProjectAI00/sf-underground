@@ -13,6 +13,7 @@ export class Race {
     this.time = 0;
     this.countdown = 0;
     this.flashT = 0;
+    this.catchUpBoost = 1;   // Speed multiplier for player catch-up
   }
 
   static bestKey(circuitId) { return "sfracer_best_" + circuitId; }
@@ -46,6 +47,33 @@ export class Race {
     return this.cpIndex < this.checkpoints.length
       ? this.checkpoints[this.cpIndex]
       : this.checkpoints[0];
+  }
+
+  /** Calculate player catch-up boost based on rival position */
+  updateCatchUp(rival) {
+    if (this.state !== "running" || !rival) {
+      this.catchUpBoost = 1;
+      return;
+    }
+    const playerProgress = this.cpIndex * 600;
+    const rivalProgress = rival.cpIndex * 600;
+    const lead = playerProgress - rivalProgress;
+    
+    if (lead < -600) {
+      // Player way behind - give speed boost
+      this.catchUpBoost = 1.08;
+    } else if (lead < -300) {
+      // Player behind - slight boost
+      this.catchUpBoost = 1.04;
+    } else if (lead > 600) {
+      // Player way ahead - slight slowdown
+      this.catchUpBoost = 0.96;
+    } else if (lead > 300) {
+      // Player ahead - tiny slowdown
+      this.catchUpBoost = 0.98;
+    } else {
+      this.catchUpBoost = 1;
+    }
   }
 
   update(dt, car) {

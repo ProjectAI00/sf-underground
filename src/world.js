@@ -3,13 +3,27 @@
 // moves; features register into global spatial grids used by every system.
 
 const CELL = 64; // meters, spatial hash cell
-const LOAD_RADIUS = 1200;
+const LOAD_RADIUS = 1600;
 const MAX_CONCURRENT = 4;
 
 function key(cx, cy) { return cx + "," + cy; }
 
 export async function loadWorld() {
   const overview = await (await fetch("data/overview.json")).json();
+  try {
+    const land = await (await fetch("data/map_land.json")).json();
+    overview.parks = land.parks || overview.parks || [];
+    overview.water = land.water || overview.water || [];
+    overview.sand = land.sand || overview.sand || [];
+    overview.shore = land.shore || [];
+    overview.bridgeWater = land.bridgeWater || [];
+  } catch {
+    overview.parks = overview.parks || [];
+    overview.water = overview.water || [];
+    overview.sand = overview.sand || [];
+    overview.shore = overview.shore || [];
+    overview.bridgeWater = overview.bridgeWater || [];
+  }
   return new World(overview);
 }
 
@@ -62,6 +76,50 @@ export class World {
       }
     }
     return true;
+  }
+
+  /** Load ALL chunks for the full map view */
+  async loadAllChunks() {
+    if (this.allChunksLoaded) return;
+    // All existing chunk coordinates
+    const chunks = [
+      [-9,-7],[-8,-8],[-8,-7],[-8,-6],[-7,-8],[-7,-7],[-7,-6],[-7,-3],[-7,-2],[-7,-1],[-7,0],[-7,1],[-7,2],[-7,3],[-7,4],[-7,5],[-7,6],
+      [-6,-8],[-6,-7],[-6,-6],[-6,-3],[-6,-2],[-6,-1],[-6,0],[-6,1],[-6,2],[-6,3],[-6,4],[-6,5],[-6,6],[-6,7],
+      [-5,-9],[-5,-8],[-5,-7],[-5,-3],[-5,-2],[-5,-1],[-5,0],[-5,1],[-5,2],[-5,3],[-5,4],[-5,5],[-5,6],[-5,7],
+      [-4,-8],[-4,-7],[-4,-6],[-4,-5],[-4,-4],[-4,-3],[-4,-2],[-4,-1],[-4,0],[-4,1],[-4,2],[-4,3],[-4,4],[-4,5],[-4,6],[-4,7],
+      [-3,-5],[-3,-4],[-3,-3],[-3,-2],[-3,-1],[-3,0],[-3,1],[-3,2],[-3,3],[-3,4],[-3,5],[-3,6],[-3,7],
+      [-2,-5],[-2,-4],[-2,-3],[-2,-2],[-2,-1],[-2,0],[-2,1],[-2,2],[-2,3],[-2,4],[-2,5],[-2,6],[-2,7],
+      [-1,-5],[-1,-4],[-1,-3],[-1,-2],[-1,-1],[-1,0],[-1,1],[-1,2],[-1,3],[-1,4],[-1,5],[-1,6],[-1,7],
+      [0,-5],[0,-4],[0,-3],[0,-2],[0,-1],[0,0],[0,1],[0,2],[0,3],[0,4],[0,5],[0,6],[0,7],
+      [1,-7],[1,-5],[1,-4],[1,-3],[1,-2],[1,-1],[1,0],[1,1],[1,2],[1,3],[1,4],[1,5],[1,6],[1,7],
+      [2,-5],[2,-4],[2,-3],[2,-2],[2,-1],[2,0],[2,1],[2,2],[2,3],[2,4],[2,5],[2,6],[2,7],[2,8],
+      [3,-5],[3,-4],[3,-3],[3,-2],[3,-1],[3,0],[3,1],[3,2],[3,3],[3,4],[3,5],[3,6],[3,7],[3,8],[3,9],
+      [4,-5],[4,-4],[4,-3],[4,-2],[4,-1],[4,0],[4,1],[4,2],[4,3],[4,4],[4,5],[4,6],[4,7],[4,8],
+      [5,-8],[5,-7],[5,-6],[5,-5],[5,-4],[5,-3],[5,-2],[5,0],[5,1],[5,2],[5,3],[5,4],[5,5],[5,6],
+      [6,-7],[6,-6],[6,-5],[6,-4],[6,-3],[6,-2],[6,2],[6,3],[6,4],[6,5],[6,6],
+      [7,-6],[7,-5],[7,-4],[7,-3],[7,4],[7,5],
+      [8,-6],[8,-5],[8,-4],[8,-3],
+      [9,-6],[9,-5],[9,-4],[9,-3],
+      [10,-5],[10,-4],[10,-3]
+    ];
+    const promises = [];
+    for (const [cx, cy] of chunks) {
+      const k = cx + "_" + cy;
+      if (this.chunkState.has(k)) continue;
+      this.chunkState.set(k, "pending");
+      promises.push(
+        fetch(`data/chunks/${k}.json`)
+          .then(res => res.ok ? res.json() : null)
+          .then(chunk => {
+            if (!chunk) { this.chunkState.set(k, "missing"); return; }
+            this.chunkState.set(k, "loaded");
+            this.#integrate(cx, cy, chunk);
+          })
+          .catch(() => this.chunkState.set(k, "missing"))
+      );
+    }
+    await Promise.all(promises);
+    this.allChunksLoaded = true;
   }
 
   #fetchChunk(cx, cy, k) {
@@ -182,12 +240,22 @@ export class World {
   }
 
   buildingAt(x, y) {
+    // Check if point is inside any building
     const arr = this.bldGrid.get(key(Math.floor(x / CELL), Math.floor(y / CELL)));
     if (!arr) return null;
+    
     for (const b of arr) {
       const bb = b.bbox;
       if (x < bb[0] || x > bb[2] || y < bb[1] || y > bb[3]) continue;
-      if (pointInPoly(b.p, x, y)) return b;
+      if (pointInPoly(b.p, x, y)) {
+        // Point is in building - but check if we're on a road
+        // Only ignore collision if actually on the road surface
+        const nearRoad = this.nearestRoad(x, y, 20);
+        if (nearRoad && nearRoad.d < nearRoad.road.w / 2) {
+          continue; // On road surface, skip this building
+        }
+        return b; // Not on road, building blocks
+      }
     }
     return null;
   }

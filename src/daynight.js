@@ -5,11 +5,17 @@ const SF_TIME = new Intl.DateTimeFormat("en-GB", {
   hour12: false,
 });
 
-const DAWN_START = 6;
+const DAWN_START = 5.5;
 const DAWN_END = 7.5;
-const DUSK_START = 19.5;
-const DUSK_END = 21;
-const NIGHT_ALPHA = 0.58;
+const DUSK_START = 19;
+const DUSK_END = 21.5;
+const NIGHT_ALPHA = 0.72;
+
+// Golden hour sub-phases for richer sunrise/sunset
+const GOLDEN_DAWN_START = 6.5;
+const GOLDEN_DAWN_END = 7.5;
+const GOLDEN_DUSK_START = 19;
+const GOLDEN_DUSK_END = 20;
 
 function clamp01(v) {
   return Math.max(0, Math.min(1, v));
@@ -53,27 +59,61 @@ function sfClock(date) {
 export function getLight(date = new Date()) {
   const { t, hour, minute } = sfClock(date);
   const clock = `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
-  const nightBlue = [10, 15, 45];
-  const warmPurple = [96, 45, 90];
+  
+  // Color palettes
+  const nightBlue = [8, 12, 40];
+  const deepPurple = [45, 20, 60];
+  const warmOrange = [255, 140, 50];
+  const goldenYellow = [255, 200, 100];
+  const pinkHorizon = [255, 120, 140];
 
+  // DAWN: dark -> purple -> orange -> golden -> day
   if (t >= DAWN_START && t < DAWN_END) {
     const p = clamp01((t - DAWN_START) / (DAWN_END - DAWN_START));
-    const lampIntensity = 1 - p;
-    const tintAlpha = NIGHT_ALPHA * lampIntensity;
-    const color = blend(nightBlue, warmPurple, p);
-    const ambient = Math.sin(p * Math.PI) * 0.1;
+    const lampIntensity = Math.max(0, 1 - p * 1.5);
+    
+    // Golden hour sub-phase
+    const inGolden = t >= GOLDEN_DAWN_START && t < GOLDEN_DAWN_END;
+    const goldenP = inGolden ? clamp01((t - GOLDEN_DAWN_START) / (GOLDEN_DAWN_END - GOLDEN_DAWN_START)) : 0;
+    
+    let tintAlpha, color, ambient, ambientColor;
+    
+    if (p < 0.4) {
+      // Early dawn: night blue -> deep purple
+      const subP = p / 0.4;
+      color = blend(nightBlue, deepPurple, subP);
+      tintAlpha = NIGHT_ALPHA * (1 - subP * 0.3);
+      ambient = subP * 0.08;
+      ambientColor = pinkHorizon;
+    } else if (p < 0.7) {
+      // Mid dawn: purple -> warm orange
+      const subP = (p - 0.4) / 0.3;
+      color = blend(deepPurple, warmOrange, subP);
+      tintAlpha = NIGHT_ALPHA * (0.7 - subP * 0.4);
+      ambient = 0.08 + subP * 0.12;
+      ambientColor = blend(pinkHorizon, warmOrange, subP);
+    } else {
+      // Late dawn / golden hour: orange -> clear
+      const subP = (p - 0.7) / 0.3;
+      color = blend(warmOrange, goldenYellow, subP);
+      tintAlpha = NIGHT_ALPHA * (0.3 - subP * 0.3);
+      ambient = (1 - subP) * 0.15;
+      ambientColor = goldenYellow;
+    }
+    
     return {
-      phase: "dawn",
+      phase: inGolden ? "golden_dawn" : "dawn",
       t,
-      tint: tintAlpha > 0 ? rgba(color[0], color[1], color[2], tintAlpha) : null,
+      tint: tintAlpha > 0.01 ? rgba(color[0], color[1], color[2], tintAlpha) : null,
       tintAlpha,
       lampIntensity,
-      headlights: true,
-      skyAmbient: ambient > 0 ? rgba(255, 154, 86, ambient) : null,
+      headlights: lampIntensity > 0.3,
+      skyAmbient: ambient > 0.01 ? rgba(ambientColor[0], ambientColor[1], ambientColor[2], ambient) : null,
       clock,
     };
   }
 
+  // DAY: clear, no tint
   if (t >= DAWN_END && t < DUSK_START) {
     return {
       phase: "day",
@@ -87,23 +127,64 @@ export function getLight(date = new Date()) {
     };
   }
 
+  // DUSK: day -> golden -> orange -> purple -> night
   if (t >= DUSK_START && t < DUSK_END) {
     const p = clamp01((t - DUSK_START) / (DUSK_END - DUSK_START));
-    const tintAlpha = NIGHT_ALPHA * p;
-    const color = blend(warmPurple, nightBlue, p);
-    const ambient = Math.sin(p * Math.PI) * 0.11;
+    
+    // Golden hour sub-phase
+    const inGolden = t >= GOLDEN_DUSK_START && t < GOLDEN_DUSK_END;
+    const goldenP = inGolden ? clamp01((t - GOLDEN_DUSK_START) / (GOLDEN_DUSK_END - GOLDEN_DUSK_START)) : 0;
+    
+    let tintAlpha, color, ambient, ambientColor;
+    
+    if (p < 0.3) {
+      // Early dusk: clear -> golden
+      const subP = p / 0.3;
+      color = goldenYellow;
+      tintAlpha = subP * 0.08;
+      ambient = subP * 0.18;
+      ambientColor = goldenYellow;
+    } else if (p < 0.5) {
+      // Golden hour peak: golden -> warm orange
+      const subP = (p - 0.3) / 0.2;
+      color = blend(goldenYellow, warmOrange, subP);
+      tintAlpha = 0.08 + subP * 0.12;
+      ambient = 0.18 - subP * 0.03;
+      ambientColor = blend(goldenYellow, warmOrange, subP);
+    } else if (p < 0.75) {
+      // Late dusk: orange -> pink/purple
+      const subP = (p - 0.5) / 0.25;
+      color = blend(warmOrange, deepPurple, subP);
+      tintAlpha = 0.2 + subP * 0.2;
+      ambient = 0.15 - subP * 0.1;
+      ambientColor = blend(warmOrange, pinkHorizon, subP);
+    } else {
+      // Twilight: purple -> night blue
+      const subP = (p - 0.75) / 0.25;
+      color = blend(deepPurple, nightBlue, subP);
+      tintAlpha = 0.4 + subP * 0.15;
+      ambient = 0.05 * (1 - subP);
+      ambientColor = pinkHorizon;
+    }
+    
+    const lampIntensity = clamp01(p * 1.5 - 0.2);
+    
     return {
-      phase: "dusk",
+      phase: inGolden ? "golden_dusk" : "dusk",
       t,
-      tint: tintAlpha > 0 ? rgba(color[0], color[1], color[2], tintAlpha) : null,
+      tint: tintAlpha > 0.01 ? rgba(color[0], color[1], color[2], tintAlpha) : null,
       tintAlpha,
-      lampIntensity: p,
-      headlights: true,
-      skyAmbient: ambient > 0 ? rgba(255, 126, 68, ambient) : null,
+      lampIntensity,
+      headlights: lampIntensity > 0.2,
+      skyAmbient: ambient > 0.01 ? rgba(ambientColor[0], ambientColor[1], ambientColor[2], ambient) : null,
       clock,
     };
   }
 
+  // NIGHT: deep blue tint with warm ambient from street lights
+  const lateNight = t >= 23 || t < 4;
+  const warmAmbient = lateNight ? 0.06 : 0.03;
+  
   return {
     phase: "night",
     t,
@@ -111,7 +192,7 @@ export function getLight(date = new Date()) {
     tintAlpha: NIGHT_ALPHA,
     lampIntensity: 1,
     headlights: true,
-    skyAmbient: null,
+    skyAmbient: warmAmbient > 0 ? rgba(255, 180, 100, warmAmbient) : null,
     clock,
   };
 }

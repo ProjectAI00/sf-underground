@@ -2,6 +2,7 @@
 // OSM is sparse, and cheap spatial grids for draw/collision hot loops.
 
 import { drawCarSprite, makeCarSprite } from "./car.js";
+import { elevOffset } from "./terrain.js";
 
 const CELL = 64;
 const CHUNK = 1000;
@@ -80,6 +81,7 @@ export class Props {
       const p = lamps[i];
       if (!p || p.length < 2) continue;
       const fixed = this.#offRoad(p[0], p[1]);
+      if (!fixed) continue; // Skip if on highway
       this.#addLamp(fixed[0], fixed[1]);
       real.push(fixed);
     }
@@ -91,6 +93,7 @@ export class Props {
       const p = signals[i];
       if (!p || p.length < 2) continue;
       const fixed = this.#offRoad(p[0], p[1]);
+      if (!fixed) continue;
       this.#addSignal(fixed[0], fixed[1]);
     }
 
@@ -99,6 +102,7 @@ export class Props {
       const p = stops[i];
       if (!p || p.length < 2) continue;
       const fixed = this.#offRoad(p[0], p[1]);
+      if (!fixed) continue;
       this.#addStop(fixed[0], fixed[1]);
     }
 
@@ -138,17 +142,30 @@ export class Props {
     return hit;
   }
 
-  draw(ctx, cam, viewR, time, light) {
+  draw(ctx, cam, viewR, time, light, playerSpeed = 0) {
     const r2 = viewR * viewR;
     const cx1 = Math.floor((cam.x - viewR) / CELL), cx2 = Math.floor((cam.x + viewR) / CELL);
     const cy1 = Math.floor((cam.y - viewR) / CELL), cy2 = Math.floor((cam.y + viewR) / CELL);
     const lampIntensity = clamp(light?.lampIntensity || 0, 0, 1);
+    
+    // LOD: skip some details at high speed for performance
+    const highSpeed = playerSpeed > 50; // ~180 km/h
+    const veryHighSpeed = playerSpeed > 75; // ~270 km/h
 
+    // Always draw parked cars
     this.#drawParkedGrid(ctx, cam, r2, cx1, cx2, cy1, cy2);
 
     ctx.lineCap = "round";
-    this.#drawStopsGrid(ctx, cam, r2, cx1, cx2, cy1, cy2);
-    this.#drawLampsGrid(ctx, cam, r2, cx1, cx2, cy1, cy2, lampIntensity);
+    
+    // Stop signs - skip at very high speed
+    if (!veryHighSpeed) {
+      this.#drawStopsGrid(ctx, cam, r2, cx1, cx2, cy1, cy2);
+    }
+    
+    // Lamps - always draw (important for night visibility)
+    this.#drawLampsGrid(ctx, cam, r2, cx1, cx2, cy1, cy2, lampIntensity, time || 0);
+    
+    // Traffic lights - always draw (gameplay important)
     this.#drawSignalsGrid(ctx, cam, r2, cx1, cx2, cy1, cy2, time || 0, lampIntensity);
   }
 
@@ -162,7 +179,7 @@ export class Props {
       seenRoads.add(rid);
 
       const spacing = r.r >= 3 ? 34 : 48;
-      const off = (r.w || 7) / 2 + 1.6;
+      const off = (r.w || 7) / 2 + 4;
       const roadHash = hashString(rid);
       const p = r.p;
       let acc = 0;
@@ -185,7 +202,7 @@ export class Props {
             if (!nearReal) {
               const side = (slot + (roadHash & 1)) % 2 ? 1 : -1;
               const fixed = this.#offRoad(x + (-dy / seg) * off * side, y + (dx / seg) * off * side);
-              this.#addLamp(fixed[0], fixed[1]);
+              if (fixed) this.#addLamp(fixed[0], fixed[1]);
             }
           }
           slot++;
@@ -206,7 +223,8 @@ export class Props {
       seenRoads.add(rid);
 
       const spacing = 13;
-      const off = Math.max(1.2, (r.w || 6) / 2 - 1.1);
+      // Place parked cars further off road so they don't block driving
+      const off = Math.max(2.5, (r.w || 6) / 2 + 0.5);
       const roadHash = hashString(rid);
       const p = r.p;
       let acc = 0;
@@ -286,17 +304,35 @@ export class Props {
   /** poles never stand on asphalt: relocate to the nearest curb if needed */
   #offRoad(x, y) {
     const nr = this.world.nearestRoad(x, y, 40);
-    if (!nr || nr.d > nr.road.w / 2 + 0.4) return [x, y];
+    if (!nr) return [x, y];
+    
+    // Skip if on a freeway/highway (rank 4+) - no lamps in the middle of highways
+    if (nr.road.r >= 4 && nr.d < nr.road.w / 2 + 2) return null;
+    
+    if (nr.d > nr.road.w / 2 + 0.4) return [x, y];
+    
     // push out perpendicular to the road, on the side the pole leans toward
     let sx = x - nr.x, sy = y - nr.y;
     const d = Math.hypot(sx, sy);
     if (d < 0.3) { sx = -nr.ty; sy = nr.tx; }
     else { sx /= d; sy /= d; }
-    const off = nr.road.w / 2 + 1.6;
-    return [
-      Math.round((nr.x + sx * off) * 10) / 10,
-      Math.round((nr.y + sy * off) * 10) / 10,
-    ];
+    const off = nr.road.w / 2 + 2.5;
+    
+    const newX = Math.round((nr.x + sx * off) * 10) / 10;
+    const newY = Math.round((nr.y + sy * off) * 10) / 10;
+    
+    // Double-check the new position isn't on another road
+    const nr2 = this.world.nearestRoad(newX, newY, 20);
+    if (nr2 && nr2.d < nr2.road.w / 2) {
+      // Still on a road, push further
+      const off2 = nr2.road.w / 2 + 2.5;
+      return [
+        Math.round((nr2.x + sx * off2) * 10) / 10,
+        Math.round((nr2.y + sy * off2) * 10) / 10,
+      ];
+    }
+    
+    return [newX, newY];
   }
 
   #updateFalling(dt) {
@@ -436,7 +472,8 @@ export class Props {
           const dx = x - cam.x, dy = y - cam.y;
           if (dx * dx + dy * dy > r2) continue;
           this.#ensureCarSprites();
-          drawCarSprite(ctx, this.carSprites[p.sprite], x, y, p.h + p.oh);
+          const vy = y + elevOffset(x, y);
+          drawCarSprite(ctx, this.carSprites[p.sprite], x, vy, p.h + p.oh);
         }
       }
     }
@@ -457,7 +494,7 @@ export class Props {
     }
   }
 
-  #drawLampsGrid(ctx, cam, r2, cx1, cx2, cy1, cy2, lampIntensity) {
+  #drawLampsGrid(ctx, cam, r2, cx1, cx2, cy1, cy2, lampIntensity, time) {
     for (let gx = cx1; gx <= cx2; gx++) {
       for (let gy = cy1; gy <= cy2; gy++) {
         const arr = this.lampGrid.get(cellKey(gx, gy));
@@ -466,7 +503,7 @@ export class Props {
           const l = this.lamps[arr[i]];
           const dx = l.x - cam.x, dy = l.y - cam.y;
           if (dx * dx + dy * dy > r2) continue;
-          this.#drawLamp(ctx, l, cam, lampIntensity);
+          this.#drawLamp(ctx, l, cam, lampIntensity, time);
         }
       }
     }
@@ -499,61 +536,83 @@ export class Props {
     ctx.globalAlpha = 1;
   }
 
-  #drawLamp(ctx, l, cam, lampIntensity) {
+  #drawLamp(ctx, l, cam, lampIntensity, time) {
+    const eOff = elevOffset(l.x, l.y);
+    const baseY = l.y + eOff;
     if (!l.alive) {
-      this.#drawFallen(ctx, l, 5.5);
+      this.#drawFallen(ctx, { ...l, y: baseY }, 5.5);
       return;
     }
     const tx = l.x + (l.x - cam.x) * LAMP_LEAN;
-    const ty = l.y + (l.y - cam.y) * LAMP_LEAN;
+    const ty = baseY + (baseY - cam.y) * LAMP_LEAN;
 
     if (lampIntensity > 0) {
-      // pre-rendered glow sprite: one drawImage instead of a gradient per lamp
-      if (!this.glowSprite) {
-        const gc = document.createElement("canvas");
-        gc.width = gc.height = 64;
-        const gg = gc.getContext("2d");
-        const grad = gg.createRadialGradient(32, 32, 0, 32, 32, 32);
-        grad.addColorStop(0, "rgba(255,205,95,0.38)");
-        grad.addColorStop(1, "rgba(255,205,95,0)");
-        gg.fillStyle = grad;
-        gg.fillRect(0, 0, 64, 64);
-        this.glowSprite = gc;
-      }
-      ctx.globalAlpha = lampIntensity;
-      ctx.drawImage(this.glowSprite, l.x - 9, l.y - 9, 18, 18);
-      ctx.globalAlpha = 1;
+      const flick = 0.96 + 0.04 * Math.sin(time * 3 + l.x * 0.2);
+      const a = lampIntensity * flick;
+      
+      // Large ground light pool - illuminates road
+      const poolR = 22;
+      const grad = ctx.createRadialGradient(l.x, baseY, 0, l.x, baseY, poolR);
+      grad.addColorStop(0, `rgba(255,230,180,${a * 0.4})`);
+      grad.addColorStop(0.25, `rgba(255,215,150,${a * 0.25})`);
+      grad.addColorStop(0.5, `rgba(255,200,120,${a * 0.12})`);
+      grad.addColorStop(0.75, `rgba(255,180,100,${a * 0.04})`);
+      grad.addColorStop(1, "rgba(255,160,80,0)");
+      ctx.fillStyle = grad;
+      ctx.beginPath();
+      ctx.ellipse(l.x, baseY, poolR, poolR * 0.55, 0, 0, Math.PI * 2);
+      ctx.fill();
+      
+      // Lamp glow halo
+      const glowR = 4;
+      const glow = ctx.createRadialGradient(tx, ty, 0, tx, ty, glowR);
+      glow.addColorStop(0, `rgba(255,240,180,${a * 0.85})`);
+      glow.addColorStop(0.4, `rgba(255,210,120,${a * 0.4})`);
+      glow.addColorStop(1, "rgba(255,180,80,0)");
+      ctx.fillStyle = glow;
+      ctx.beginPath();
+      ctx.arc(tx, ty, glowR, 0, Math.PI * 2);
+      ctx.fill();
     }
-    ctx.fillStyle = "rgba(25,20,15,0.3)";
-    ctx.fillRect(l.x - 0.4, l.y - 0.4, 0.8, 0.8);
-    ctx.strokeStyle = "#46423c";
-    ctx.lineWidth = 0.32;
+
+    // Pole shadow
+    ctx.fillStyle = "rgba(20,18,15,0.2)";
+    ctx.fillRect(l.x + 0.15, baseY + 0.15, 0.4, 0.4);
+    
+    // Pole
+    ctx.strokeStyle = "#3a3530";
+    ctx.lineWidth = 0.28;
     ctx.beginPath();
-    ctx.moveTo(l.x, l.y);
+    ctx.moveTo(l.x, baseY);
     ctx.lineTo(tx, ty);
     ctx.stroke();
 
-    ctx.fillStyle = `rgba(255,214,120,${0.18 + lampIntensity * 0.34})`;
-    ctx.beginPath();
-    ctx.arc(tx, ty, 1.6 + lampIntensity * 1.2, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.fillStyle = "#ffd678";
-    ctx.fillRect(tx - 0.42, ty - 0.42, 0.84, 0.84);
+    // Lamp housing
+    ctx.fillStyle = "#2a2825";
+    ctx.fillRect(tx - 0.35, ty - 0.2, 0.7, 0.4);
+    
+    // Light bulb (bright point)
+    if (lampIntensity > 0) {
+      ctx.fillStyle = "#fffae0";
+      ctx.fillRect(tx - 0.18, ty - 0.1, 0.36, 0.2);
+    }
   }
 
   #drawStop(ctx, s, cam) {
+    const eOff = elevOffset(s.x, s.y);
+    const baseY = s.y + eOff;
     if (!s.alive) {
-      this.#drawFallen(ctx, s, 3.0);
+      this.#drawFallen(ctx, { ...s, y: baseY }, 3.0);
       return;
     }
     const tx = s.x + (s.x - cam.x) * SIGN_LEAN;
-    const ty = s.y + (s.y - cam.y) * SIGN_LEAN;
+    const ty = baseY + (baseY - cam.y) * SIGN_LEAN;
     ctx.fillStyle = "rgba(25,20,15,0.28)";
-    ctx.fillRect(s.x - 0.32, s.y - 0.32, 0.64, 0.64);
+    ctx.fillRect(s.x - 0.32, baseY - 0.32, 0.64, 0.64);
     ctx.strokeStyle = "#3a3833";
     ctx.lineWidth = 0.24;
     ctx.beginPath();
-    ctx.moveTo(s.x, s.y);
+    ctx.moveTo(s.x, baseY);
     ctx.lineTo(tx, ty);
     ctx.stroke();
 
@@ -566,35 +625,80 @@ export class Props {
   }
 
   #drawTrafficLight(ctx, l, cam, time, lampIntensity) {
+    const eOff = elevOffset(l.x, l.y);
+    const baseY = l.y + eOff;
     if (!l.alive) {
-      this.#drawFallen(ctx, l, 4.5);
+      this.#drawFallen(ctx, { ...l, y: baseY }, 4.5);
       return;
     }
     const tx = l.x + (l.x - cam.x) * LIGHT_LEAN;
-    const ty = l.y + (l.y - cam.y) * LIGHT_LEAN;
+    const ty = baseY + (baseY - cam.y) * LIGHT_LEAN;
+    
+    // Shadow
     ctx.fillStyle = "rgba(25,20,15,0.3)";
-    ctx.fillRect(l.x - 0.4, l.y - 0.4, 0.8, 0.8);
+    ctx.fillRect(l.x - 0.4, baseY - 0.4, 0.8, 0.8);
+    
+    // Pole
     ctx.strokeStyle = "#3a3833";
     ctx.lineWidth = 0.36;
     ctx.beginPath();
-    ctx.moveTo(l.x, l.y);
+    ctx.moveTo(l.x, baseY);
     ctx.lineTo(tx, ty);
     ctx.stroke();
 
-    ctx.fillStyle = "#2d2b28";
-    ctx.fillRect(tx - 0.55, ty - 1.05, 1.1, 2.1);
+    // Housing (3-light vertical)
+    ctx.fillStyle = "#1a1a1a";
+    ctx.fillRect(tx - 0.65, ty - 1.4, 1.3, 2.8);
+    ctx.strokeStyle = "#333";
+    ctx.lineWidth = 0.1;
+    ctx.strokeRect(tx - 0.65, ty - 1.4, 1.3, 2.8);
 
-    const green = ((time / 3.5 + l.phase) % 2) < 1;
-    const lx = tx;
-    const ly = green ? ty + 0.5 : ty - 0.5;
-    if (lampIntensity > 0) {
-      ctx.fillStyle = green ? `rgba(95,224,122,${lampIntensity * 0.22})` : `rgba(255,90,82,${lampIntensity * 0.22})`;
+    // Realistic timing: 25s green, 4s yellow, 25s red (54s cycle)
+    const cycle = 54;
+    const phase = ((time + l.phase * cycle) % cycle);
+    let color = "red";
+    if (phase < 25) color = "green";
+    else if (phase < 29) color = "yellow";
+    // else red (29-54)
+
+    // Draw all three lights (dim when off)
+    const lights = [
+      { y: ty - 0.85, color: "red", on: color === "red" },
+      { y: ty, color: "yellow", on: color === "yellow" },
+      { y: ty + 0.85, color: "green", on: color === "green" }
+    ];
+    
+    const colors = {
+      red: { on: "#ff3030", off: "#401010", glow: "rgba(255,60,60," },
+      yellow: { on: "#ffcc00", off: "#403000", glow: "rgba(255,200,0," },
+      green: { on: "#30ff50", off: "#103010", glow: "rgba(60,255,80," }
+    };
+
+    for (const light of lights) {
+      const c = colors[light.color];
+      
+      // Glow when on
+      if (light.on && lampIntensity > 0) {
+        ctx.fillStyle = c.glow + (lampIntensity * 0.25) + ")";
+        ctx.beginPath();
+        ctx.arc(tx, light.y, 1.8, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      
+      // Light circle
+      ctx.fillStyle = light.on ? c.on : c.off;
       ctx.beginPath();
-      ctx.arc(lx, ly, 1.05, 0, Math.PI * 2);
+      ctx.arc(tx, light.y, 0.35, 0, Math.PI * 2);
       ctx.fill();
+      
+      // Bright center when on
+      if (light.on) {
+        ctx.fillStyle = "rgba(255,255,255,0.5)";
+        ctx.beginPath();
+        ctx.arc(tx, light.y, 0.15, 0, Math.PI * 2);
+        ctx.fill();
+      }
     }
-    ctx.fillStyle = green ? "#5fe07a" : "#ff5a52";
-    ctx.fillRect(tx - 0.32, green ? ty + 0.18 : ty - 0.82, 0.64, 0.64);
   }
 
   #octagon(ctx, x, y, r) {

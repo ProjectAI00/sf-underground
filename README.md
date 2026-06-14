@@ -1,9 +1,8 @@
-# SF UNDERGROUND
+# Retro Racer SF
 
-Top-down retro street racer (GTA Chinatown Wars vibes) on the **real map of San
-Francisco** — the whole city, streamed in 1km chunks Minecraft-style as you
-drive. Roads, buildings (with real floor counts), parks, trees, crosswalks,
-traffic signals and lamps all come from OpenStreetMap.
+Top-down retro street racer on the **real map of San Francisco** — the whole city, streamed in 1km chunks as you drive. Free roam solo or cruise with up to 100 drivers in a room.
+
+**Live:** deploy to Vercel — see [DEPLOY.md](DEPLOY.md). Multiplayer needs the separate WebSocket server in `server/`.
 
 ## Run
 
@@ -13,14 +12,25 @@ python3 -m http.server 8847
 # open http://localhost:8847
 ```
 
-No build step, no dependencies.
+### Multiplayer (local)
+
+In a second terminal:
+
+```bash
+cd server && npm install && npm start
+# WebSocket on ws://localhost:8787
+```
+
+Two browser tabs → **MULTIPLAYER** → **CREATE ROOM** in one, **JOIN ROOM** with the same code in the other. Each client only renders drivers within ~1.2 km (traffic/peds stay local).
+
+No build step for the game client.
 
 ## Play
 
 1. **Driver registration**: pick a gamer tag and one of the B-tier rides —
    Porsche 944, BMW M3 '08, Tesla Model S Techbro Edition, Nissan GT-R R34.
    Five stats: SPEED / ACCEL / BRAKES / CORNER / **AURA**.
-2. Pick a race (3 circuits over real streets) or free roam.
+2. **Main menu**: **FREE ROAM** (solo) or **MULTIPLAYER** (create/join room code).
 
 | Key | Action |
 |---|---|
@@ -44,20 +54,15 @@ No build step, no dependencies.
   OSM-mapped corners.
 - **Drift physics**: handbrake kicks the rear out, tire smoke, skid marks,
   crash sparks, burnouts, brake lights.
-- **3 circuits**: Chinatown Sprint, Grand Tour, Sunset Run — checkpoints on
-  real streets, best times saved per circuit.
-- **CAMPAIGN — 10 races against tech**: climb from THE INTERN through PG,
-  Jensen, Elon… to the final boss: **Sam Altman in his red McLaren F1**.
-  AI rivals race the same circuits (road-following, corner braking, light
-  rubber-banding). Win to unlock the next race.
+- **3 circuits** (time trial data still in `src/race.js`; menu focuses on roam/multiplayer for now).
+- **Multiplayer**: room codes, up to 100 drivers, nearby-only sync (~1.2 km), nametags, interpolated ghosts.
 - **Full city map** (click the radar or press **M**): pan, zoom, and click to
   set a Google-Maps-style waypoint — amber guidance arrow + radar blip in-game.
-- **RADIO** (top of screen, **Q** to change station, **-/=** volume): five
-  built-in stations (SomaFM: Underground 80s, Groove Salad, DEF CON, Secret
-  Agent, Metal) plus a **Spotify** station — connect your Premium account
-  (one-time Client ID setup, instructions in-game) and the game becomes a
-  Spotify Connect device: cast any playlist or podcast to "SF UNDERGROUND
-  RADIO" from your phone, track info shows in the HUD.
+- **RADIO** (top bar — **Q** next station, **Shift+Q** prev, swipe on mobile, **-/=** volume):
+  - **SomaFM** streams — no login, scales to any player count.
+  - **Spotify stations** — your playlist + podcast channels in `data/radio-stations.json`.
+    Each player connects their own Premium account (PKCE, no shared server).
+    ~3 API calls only when you change station; audio streams from Spotify CDN.
 
 ## Rebuilding the map
 
@@ -75,6 +80,7 @@ port the game to any city.
 - `src/render.js` — tile-cached ground/roads renderer + per-frame 2.5D buildings.
 - `src/car.js`, `src/cars.js` — arcade physics, stats, pixel-art car sprites.
 - `src/traffic.js`, `src/peds.js`, `src/props.js` — city life.
+- `src/multiplayer.js`, `src/remote-players.js`, `server/` — WebSocket rooms + nearby player sync.
 - `src/race.js`, `src/radar.js`, `src/menu.js`, `src/lobby.js`, `src/daynight.js` — game flow.
 
 Map data © OpenStreetMap contributors, ODbL.

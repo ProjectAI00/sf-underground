@@ -1,0 +1,15 @@
+{
+  "stations": [
+    { "id": "off", "name": "RADIO OFF", "tag": "" },
+
+    { "id": "drive", "name": "NIGHT DRIVE", "tag": "YOUR PLAYLIST", "spotify": "YOUR_PLAYLIST_URL_OR_URI", "shuffle": true },
+
+    { "id": "pod-1", "name": "POD · CHANNEL 1", "tag": "PODCAST", "spotify": "YOUR_PODCAST_PLAYLIST_OR_SHOW_URI", "shuffle": false },
+    { "id": "pod-2", "name": "POD · CHANNEL 2", "tag": "PODCAST", "spotify": "YOUR_PODCAST_PLAYLIST_OR_SHOW_URI", "shuffle": false },
+    { "id": "pod-3", "name": "POD · CHANNEL 3", "tag": "PODCAST", "spotify": "YOUR_PODCAST_PLAYLIST_OR_SHOW_URI", "shuffle": false },
+
+    { "id": "groove", "name": "GROOVE SALAD", "tag": "CHILL BEATS", "url": "https://ice1.somafm.com/groovesalad-128-mp3" },
+    { "id": "u80s", "name": "UNDERGROUND 80s", "tag": "SYNTH // NEW WAVE", "url": "https://ice2.somafm.com/u80s-128-mp3" },
+    { "id": "defcon", "name": "DEF CON RADIO", "tag": "HACKER ELECTRONIC", "url": "https://ice1.somafm.com/defcon-128-mp3" }
+  ]
+}

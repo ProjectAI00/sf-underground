@@ -1,33 +1,27 @@
 export class Menu {
   constructor({
-    circuits = [],
-    getBest = () => null,
-    campaign = null, // { missions: [{id, title, taunt}], getProgress: () => nextUnbeatenIndex }
-    onStartRace = () => {},
-    onStartCampaign = () => {},
     onFreeRoam = () => {},
+    onMultiplayer = () => {},
     onResume = () => {},
-    onRestartRace = () => {},
+    onLeaveMultiplayer = () => {},
     onQuitToMenu = () => {},
   } = {}) {
-    this.circuits = circuits;
-    this.getBest = getBest;
-    this.campaign = campaign;
     this.callbacks = {
-      onStartRace,
-      onStartCampaign,
       onFreeRoam,
+      onMultiplayer,
       onResume,
-      onRestartRace,
+      onLeaveMultiplayer,
       onQuitToMenu,
     };
 
-    this.mode = "main";
+    this.mode = "main"; // main | multiplayer | room | pause
     this.isShown = false;
     this.loading = false;
-    this.inRace = false;
+    this.inMultiplayer = false;
     this.selection = 0;
     this.items = [];
+    this.roomCode = "";
+    this.roomError = "";
 
     this.root = document.createElement("div");
     this.root.className = "sf-menu sf-menu--hidden";
@@ -40,9 +34,9 @@ export class Menu {
     const logo = document.createElement("div");
     logo.className = "sf-menu__logo";
     logo.innerHTML = `
-      <div class="sf-menu__logo-sf">SF</div>
-      <div class="sf-menu__logo-underground">UNDERGROUND</div>
-      <div class="sf-menu__tagline">-- SAN FRANCISCO STREET RACING --</div>
+      <div class="sf-menu__logo-sf">RETRO RACER</div>
+      <div class="sf-menu__logo-underground">SF</div>
+      <div class="sf-menu__tagline">-- SAN FRANCISCO FREE ROAM --</div>
     `;
 
     this.loadingEl = document.createElement("div");
@@ -50,17 +44,72 @@ export class Menu {
     this.loadingEl.textContent = "LOADING SAN FRANCISCO...";
 
     this.mainList = document.createElement("div");
-    this.mainList.className = "sf-menu__list sf-menu__main-list";
+    this.mainList.className = "sf-menu__list sf-menu__main-list sf-menu__main-list--horizontal";
     this.mainList.setAttribute("role", "menu");
 
     const footer = document.createElement("div");
     footer.className = "sf-menu__footer";
     footer.innerHTML = `
-      <div>ARROWS SELECT &middot; ENTER START &middot; ESC PAUSE IN GAME</div>
-      <div>WASD DRIVE &middot; SPACE HANDBRAKE &middot; C CAMERA &middot; R RESET</div>
+      <div>◀ ▶ OR ARROWS · ENTER START · ESC PAUSE</div>
+      <div>WASD DRIVE · SPACE HANDBRAKE · Q RADIO · M MAP</div>
     `;
 
     this.mainView.append(logo, this.loadingEl, this.mainList, footer);
+
+    this.mpView = document.createElement("section");
+    this.mpView.className = "sf-menu__view sf-menu__mp";
+    this.mpView.setAttribute("aria-label", "Multiplayer");
+
+    const mpPanel = document.createElement("div");
+    mpPanel.className = "sf-menu__pause-panel";
+
+    const mpTitle = document.createElement("h2");
+    mpTitle.className = "sf-menu__pause-title";
+    mpTitle.textContent = "MULTIPLAYER";
+
+    this.mpHint = document.createElement("p");
+    this.mpHint.className = "sf-menu__mp-hint";
+    this.mpHint.textContent = "UP TO 100 DRIVERS PER ROOM";
+
+    this.mpList = document.createElement("div");
+    this.mpList.className = "sf-menu__list sf-menu__mp-list";
+    this.mpList.setAttribute("role", "menu");
+
+    mpPanel.append(mpTitle, this.mpHint, this.mpList);
+    this.mpView.append(mpPanel);
+
+    this.roomView = document.createElement("section");
+    this.roomView.className = "sf-menu__view sf-menu__room";
+    this.roomView.setAttribute("aria-label", "Room code");
+
+    const roomPanel = document.createElement("div");
+    roomPanel.className = "sf-menu__pause-panel";
+
+    const roomTitle = document.createElement("h2");
+    roomTitle.className = "sf-menu__pause-title";
+    roomTitle.textContent = "JOIN ROOM";
+
+    this.roomHint = document.createElement("p");
+    this.roomHint.className = "sf-menu__mp-hint";
+    this.roomHint.textContent = "TYPE ROOM CODE · ENTER TO JOIN";
+
+    this.roomInput = document.createElement("input");
+    this.roomInput.className = "sf-menu__room-input";
+    this.roomInput.type = "text";
+    this.roomInput.maxLength = 20;
+    this.roomInput.spellcheck = false;
+    this.roomInput.autocomplete = "off";
+    this.roomInput.setAttribute("aria-label", "Room code");
+
+    this.roomErrorEl = document.createElement("p");
+    this.roomErrorEl.className = "sf-menu__room-error";
+
+    const roomFooter = document.createElement("p");
+    roomFooter.className = "sf-menu__mp-hint sf-menu__mp-hint--dim";
+    roomFooter.textContent = "ESC BACK";
+
+    roomPanel.append(roomTitle, this.roomHint, this.roomInput, this.roomErrorEl, roomFooter);
+    this.roomView.append(roomPanel);
 
     this.pauseView = document.createElement("section");
     this.pauseView.className = "sf-menu__view sf-menu__pause";
@@ -79,8 +128,27 @@ export class Menu {
 
     pausePanel.append(pauseTitle, this.pauseList);
     this.pauseView.append(pausePanel);
-    this.root.append(this.mainView, this.pauseView);
+
+    this.root.append(this.mainView, this.mpView, this.roomView, this.pauseView);
     document.body.appendChild(this.root);
+
+    let menuTouchX = null;
+    this.mainView.addEventListener("touchstart", (e) => {
+      menuTouchX = e.changedTouches[0]?.clientX ?? null;
+    }, { passive: true });
+    this.mainView.addEventListener("touchend", (e) => {
+      if (menuTouchX == null || this.mode !== "main" || this.loading) return;
+      const dx = (e.changedTouches[0]?.clientX ?? menuTouchX) - menuTouchX;
+      menuTouchX = null;
+      if (Math.abs(dx) > 40) this.moveSelection(dx < 0 ? 1 : -1);
+    }, { passive: true });
+
+    this.roomInput.addEventListener("input", () => {
+      this.roomCode = this.roomInput.value.toUpperCase().replace(/[^A-Z0-9-]/g, "");
+      this.roomInput.value = this.roomCode;
+      this.roomError = "";
+      this.roomErrorEl.textContent = "";
+    });
 
     this.renderMainItems();
     this.renderPauseItems();
@@ -106,9 +174,35 @@ export class Menu {
     this.updateVisibility();
   }
 
-  showPause({ inRace = false } = {}) {
+  showMultiplayer() {
+    this.mode = "multiplayer";
+    this.loading = false;
+    this.selection = 0;
+    this.isShown = true;
+    this.renderMultiplayerItems();
+    this.updateVisibility();
+    this.updateSelection();
+  }
+
+  showRoomJoin() {
+    this.mode = "room";
+    this.roomCode = "";
+    this.roomError = "";
+    this.roomInput.value = "";
+    this.roomErrorEl.textContent = "";
+    this.isShown = true;
+    this.updateVisibility();
+    setTimeout(() => this.roomInput.focus(), 0);
+  }
+
+  setRoomError(msg) {
+    this.roomError = msg;
+    this.roomErrorEl.textContent = msg;
+  }
+
+  showPause({ inMultiplayer = false } = {}) {
     this.mode = "pause";
-    this.inRace = Boolean(inRace);
+    this.inMultiplayer = Boolean(inMultiplayer);
     this.loading = false;
     this.selection = 0;
     this.isShown = true;
@@ -126,6 +220,26 @@ export class Menu {
     if (!this.visible) return false;
 
     const key = event.key;
+
+    if (this.mode === "room") {
+      if (key === "Escape") {
+        event.preventDefault();
+        this.showMultiplayer();
+        return true;
+      }
+      if (key === "Enter") {
+        event.preventDefault();
+        const code = this.roomCode.trim();
+        if (code.length < 3) {
+          this.setRoomError("ENTER A ROOM CODE");
+          return true;
+        }
+        this.callbacks.onMultiplayer(code);
+        return true;
+      }
+      return false;
+    }
+
     const isHandledKey = (
       key === "ArrowUp" ||
       key === "ArrowDown" ||
@@ -147,12 +261,12 @@ export class Menu {
       return true;
     }
 
-    if (key === "ArrowUp" || key === "w" || key === "W") {
+    if (key === "ArrowUp" || key === "w" || key === "W" || key === "ArrowLeft" || key === "a" || key === "A") {
       this.moveSelection(-1);
       return true;
     }
 
-    if (key === "ArrowDown" || key === "s" || key === "S") {
+    if (key === "ArrowDown" || key === "s" || key === "S" || key === "ArrowRight" || key === "d" || key === "D") {
       this.moveSelection(1);
       return true;
     }
@@ -165,6 +279,8 @@ export class Menu {
     if (key === "Escape") {
       if (this.mode === "pause") {
         this.callbacks.onResume();
+      } else if (this.mode === "multiplayer") {
+        this.showMain({ loading: false });
       }
       return true;
     }
@@ -176,44 +292,41 @@ export class Menu {
     this.mainList.replaceChildren();
     this.items = [];
 
-    if (this.campaign) {
-      const next = this.campaign.getProgress();
-      if (next >= this.campaign.missions.length) {
-        this.addItem(this.mainList, {
-          label: "CAMPAIGN COMPLETE — YOU BEAT TECH",
-          meta: "REPLAY FINAL",
-          action: () => this.callbacks.onStartCampaign(this.campaign.missions.length - 1),
-        });
-      } else {
-        const m = this.campaign.missions[next];
-        this.addItem(this.mainList, {
-          label: `CAMPAIGN: ${m.title}`,
-          meta: `${next}/${this.campaign.missions.length} BEATEN`,
-          action: () => this.callbacks.onStartCampaign(next),
-        });
-        if (next > 0) {
-          const prev = this.campaign.missions[next - 1];
-          this.addItem(this.mainList, {
-            label: `REMATCH: ${prev.name}`,
-            meta: "BEATEN",
-            action: () => this.callbacks.onStartCampaign(next - 1),
-          });
-        }
-      }
-    }
-
-    for (const circuit of this.circuits) {
-      this.addItem(this.mainList, {
-        label: `RACE: ${circuit.label}`,
-        meta: this.formatBest(circuit.id),
-        action: () => this.callbacks.onStartRace(circuit.id),
-      });
-    }
-
     this.addItem(this.mainList, {
       label: "FREE ROAM",
-      meta: "",
+      meta: "SOLO",
       action: () => this.callbacks.onFreeRoam(),
+    });
+
+    this.addItem(this.mainList, {
+      label: "MULTIPLAYER",
+      meta: "JOIN / CREATE ROOM",
+      action: () => this.showMultiplayer(),
+    });
+
+    this.clampSelection();
+  }
+
+  renderMultiplayerItems() {
+    this.mpList.replaceChildren();
+    this.items = [];
+
+    this.addItem(this.mpList, {
+      label: "CREATE ROOM",
+      meta: "NEW CODE",
+      action: () => this.callbacks.onMultiplayer(null),
+    });
+
+    this.addItem(this.mpList, {
+      label: "JOIN ROOM",
+      meta: "ENTER CODE",
+      action: () => this.showRoomJoin(),
+    });
+
+    this.addItem(this.mpList, {
+      label: "BACK",
+      meta: "",
+      action: () => this.showMain({ loading: false }),
     });
 
     this.clampSelection();
@@ -221,10 +334,7 @@ export class Menu {
 
   renderPauseItems() {
     this.pauseList.replaceChildren();
-
-    if (this.mode === "pause") {
-      this.items = [];
-    }
+    this.items = [];
 
     this.addItem(this.pauseList, {
       label: "RESUME",
@@ -232,11 +342,11 @@ export class Menu {
       action: () => this.callbacks.onResume(),
     });
 
-    if (this.inRace) {
+    if (this.inMultiplayer) {
       this.addItem(this.pauseList, {
-        label: "RESTART RACE",
+        label: "LEAVE ROOM",
         meta: "",
-        action: () => this.callbacks.onRestartRace(),
+        action: () => this.callbacks.onLeaveMultiplayer(),
       });
     }
 
@@ -271,12 +381,12 @@ export class Menu {
 
     button.append(chevron, labelEl, metaEl);
     button.addEventListener("mouseenter", () => {
-      if (this.mode === "main" && this.loading) return;
+      if ((this.mode === "main" && this.loading) || this.mode === "room") return;
       this.selection = index;
       this.updateSelection();
     });
     button.addEventListener("click", () => {
-      if (this.mode === "main" && this.loading) return;
+      if ((this.mode === "main" && this.loading) || this.mode === "room") return;
       this.selection = index;
       this.activateSelection();
     });
@@ -312,6 +422,8 @@ export class Menu {
     this.root.classList.toggle("sf-menu--hidden", !this.isShown);
     this.root.classList.toggle("sf-menu--loading", this.mode === "main" && this.loading);
     this.mainView.classList.toggle("sf-menu__view--active", this.mode === "main");
+    this.mpView.classList.toggle("sf-menu__view--active", this.mode === "multiplayer");
+    this.roomView.classList.toggle("sf-menu__view--active", this.mode === "room");
     this.pauseView.classList.toggle("sf-menu__view--active", this.mode === "pause");
     this.root.setAttribute("aria-hidden", String(!this.isShown));
   }
@@ -327,21 +439,5 @@ export class Menu {
     } else if (this.selection >= this.items.length) {
       this.selection = 0;
     }
-  }
-
-  formatBest(circuitId) {
-    const best = this.getBest(circuitId);
-
-    if (typeof best !== "number" || !Number.isFinite(best)) {
-      return "--:--";
-    }
-
-    let totalCentiseconds = Math.round(best * 100);
-    const minutes = Math.floor(totalCentiseconds / 6000);
-    totalCentiseconds -= minutes * 6000;
-    const seconds = Math.floor(totalCentiseconds / 100);
-    const centiseconds = totalCentiseconds % 100;
-
-    return `BEST ${minutes}:${String(seconds).padStart(2, "0")}.${String(centiseconds).padStart(2, "0")}`;
   }
 }

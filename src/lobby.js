@@ -1,49 +1,33 @@
-const MAX_TAG_LENGTH = 14;
-const FOCUS_ORDER = ["tag", "cars", "confirm"];
-const STYLE_ID = "sf-lobby-style";
-const TAG_CHAR = /^[a-zA-Z0-9_-]$/;
+import { makeCarSpriteFor } from "./cars.js";
+import { preloadCarSprite } from "./car-sprites.js";
 
-function clampStat(value) {
-  return Math.max(0, Math.min(10, Math.round(Number(value) || 0)));
-}
+const MAX_TAG_LENGTH = 14;
 
 function normalizeTag(value) {
-  const raw = String(value || "").trim();
-  const body = raw
-    .replace(/^@+/, "")
-    .replace(/@+/g, "")
+  return String(value || "")
+    .trim()
     .replace(/[^a-zA-Z0-9_-]/g, "")
-    .slice(0, MAX_TAG_LENGTH - 1);
-
-  return `@${body}`;
-}
-
-function tagBody(value) {
-  return normalizeTag(value).slice(1);
+    .slice(0, MAX_TAG_LENGTH)
+    .toUpperCase();
 }
 
 export class Lobby {
-  constructor({
-    cars = [],
-    drawPreview = () => {},
-    profile = null,
-    onComplete = () => {},
-  } = {}) {
+  constructor({ cars = [], profile = null, onComplete = () => {} } = {}) {
     this.cars = cars;
-    this.drawPreview = drawPreview;
     this.onComplete = onComplete;
     this.isShown = false;
-    this.focusZone = "tag";
-    this.cardButtons = [];
+    this.sprites = new Map();
+    this.animFrame = null;
+    this.bobPhase = 0;
 
-    const profileCarIndex = this.cars.findIndex((car) => car.id === profile?.carId);
-    this.selectedIndex = profileCarIndex >= 0 ? profileCarIndex : (this.cars.length > 0 ? 0 : -1);
+    const profileCarIndex = this.cars.findIndex((c) => c.id === profile?.carId);
+    this.selectedIndex = profileCarIndex >= 0 ? profileCarIndex : 0;
+    this.initialTag = profile?.tag?.replace(/^@/, "") || "";
 
-    this.ensureStylesheet();
-    this.buildDom(normalizeTag(profile?.tag || ""));
+    this.buildDom();
+    this.renderCards();
     this.updateSelection();
-    this.updateConfirmState();
-    this.updateVisibility();
+    this.startAnimLoop();
   }
 
   get visible() {
@@ -54,551 +38,306 @@ export class Lobby {
     return this.cars[this.selectedIndex] || null;
   }
 
+  spriteFor(carId) {
+    if (!this.sprites.has(carId)) {
+      const def = this.cars.find((c) => c.id === carId);
+      if (def) {
+        this.sprites.set(carId, makeCarSpriteFor(def, 6));
+        preloadCarSprite(carId, () => {
+          this.sprites.set(carId, makeCarSpriteFor(def, 6));
+          this.paintCards();
+        });
+      }
+    }
+    return this.sprites.get(carId);
+  }
+
   show() {
     this.isShown = true;
-    this.focusZone = "tag";
-    this.updateVisibility();
-    this.updateFocusState();
-    this.focusCurrentZone();
+    this.root.classList.remove("sf-lobby--hidden");
+    this.tagInput.focus();
+    this.scrollToSelected();
   }
 
   hide() {
     this.isShown = false;
-    this.updateVisibility();
+    this.root.classList.add("sf-lobby--hidden");
   }
 
   handleKey(event) {
     if (!this.visible) return false;
 
-    if (event.__sfLobbyHandled) return true;
-    event.__sfLobbyHandled = true;
-    event.preventDefault();
-    event.stopPropagation();
-
-    this.syncFocusFromTarget(event.target);
+    // If typing in input, only handle special keys
+    if (document.activeElement === this.tagInput) {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        this.cardButtons[this.selectedIndex]?.focus();
+        return true;
+      }
+      if (event.key === "ArrowDown") {
+        event.preventDefault();
+        this.cardButtons[this.selectedIndex]?.focus();
+        return true;
+      }
+      // Let all other keys go to the input normally
+      return false;
+    }
 
     const key = event.key;
     if (key === "Escape") return true;
 
-    if (key === "Tab") {
-      this.cycleFocus(event.shiftKey ? -1 : 1);
+    if (key === "ArrowLeft" || key === "a" || key === "A") {
+      event.preventDefault();
+      this.moveSelection(-1);
+      return true;
+    }
+    if (key === "ArrowRight" || key === "d" || key === "D") {
+      event.preventDefault();
+      this.moveSelection(1);
+      return true;
+    }
+    if (key === "ArrowUp") {
+      event.preventDefault();
+      this.tagInput.focus();
+      return true;
+    }
+    if (key === "Enter" || key === " ") {
+      event.preventDefault();
+      this.confirm();
       return true;
     }
 
-    if (this.focusZone === "tag") {
-      return this.handleTagKey(event);
-    }
-
-    if (this.focusZone === "cars") {
-      return this.handleCarKey(key);
-    }
-
-    if (this.focusZone === "confirm") {
-      return this.handleConfirmKey(key);
-    }
-
-    return true;
+    return false;
   }
 
-  ensureStylesheet() {
-    if (document.getElementById(STYLE_ID)) return;
-
-    const link = document.createElement("link");
-    link.id = STYLE_ID;
-    link.rel = "stylesheet";
-    link.href = new URL("./lobby.css", import.meta.url).href;
-    document.head.appendChild(link);
-  }
-
-  buildDom(initialTag) {
+  buildDom() {
     this.root = document.createElement("div");
     this.root.className = "sf-lobby sf-lobby--hidden";
-    this.root.setAttribute("role", "dialog");
-    this.root.setAttribute("aria-modal", "true");
-    this.root.setAttribute("aria-label", "Driver registration");
-    this.root.addEventListener("keydown", (event) => this.handleKey(event));
 
-    const shell = document.createElement("section");
-    shell.className = "sf-lobby__shell";
+    // Username section
+    const usernameSection = document.createElement("div");
+    usernameSection.className = "sf-lobby__username";
 
-    const header = document.createElement("header");
-    header.className = "sf-lobby__header";
-
-    const kicker = document.createElement("div");
-    kicker.className = "sf-lobby__kicker";
-    kicker.textContent = "WELCOME TO SF UNDERGROUND";
-
-    const title = document.createElement("h1");
-    title.className = "sf-lobby__title";
-    title.textContent = "DRIVER REGISTRATION";
-
-    header.append(kicker, title);
-
-    const body = document.createElement("main");
-    body.className = "sf-lobby__body";
-
-    const leftColumn = document.createElement("aside");
-    leftColumn.className = "sf-lobby__left";
-
-    this.tagFrame = document.createElement("label");
-    this.tagFrame.className = "sf-lobby__field sf-lobby__tag-frame";
-
-    const tagStep = document.createElement("span");
-    tagStep.className = "sf-lobby__step";
-    tagStep.textContent = "STEP 1";
-
-    const tagLabel = document.createElement("span");
-    tagLabel.className = "sf-lobby__field-label";
-    tagLabel.textContent = "PICK A GAMER TAG";
+    const usernameLabel = document.createElement("label");
+    usernameLabel.className = "sf-lobby__username-label";
+    usernameLabel.textContent = "ENTER YOUR NAME";
 
     this.tagInput = document.createElement("input");
-    this.tagInput.className = "sf-lobby__tag-input";
+    this.tagInput.className = "sf-lobby__username-input";
     this.tagInput.type = "text";
     this.tagInput.maxLength = MAX_TAG_LENGTH;
+    this.tagInput.placeholder = "DRIVER";
     this.tagInput.spellcheck = false;
     this.tagInput.autocomplete = "off";
-    this.tagInput.inputMode = "text";
-    this.tagInput.value = initialTag;
-    this.tagInput.setAttribute("aria-label", "Pick a gamer tag");
-    this.tagInput.addEventListener("focus", () => this.setFocus("tag"));
-    this.tagInput.addEventListener("input", () => this.normalizeInputFromDom());
+    this.tagInput.value = this.initialTag;
+    this.tagInput.addEventListener("input", () => this.updateConfirmState());
 
-    const tagHint = document.createElement("span");
-    tagHint.className = "sf-lobby__hint";
-    tagHint.textContent = "2+ CHARS AFTER @";
+    usernameSection.append(usernameLabel, this.tagInput);
 
-    this.tagFrame.append(tagStep, tagLabel, this.tagInput, tagHint);
+    // Cards container
+    this.cardsContainer = document.createElement("div");
+    this.cardsContainer.className = "sf-lobby__cards";
 
-    this.carSummary = document.createElement("div");
-    this.carSummary.className = "sf-lobby__field sf-lobby__car-summary";
+    // Confirm button
+    this.confirmBtn = document.createElement("button");
+    this.confirmBtn.className = "sf-lobby__confirm";
+    this.confirmBtn.type = "button";
+    this.confirmBtn.textContent = "START ENGINE ►";
+    this.confirmBtn.addEventListener("click", () => this.confirm());
 
-    const carStep = document.createElement("span");
-    carStep.className = "sf-lobby__step";
-    carStep.textContent = "STEP 2";
-
-    const carLabel = document.createElement("span");
-    carLabel.className = "sf-lobby__field-label";
-    carLabel.textContent = "PICK A CAR";
-
-    this.selectedCarName = document.createElement("div");
-    this.selectedCarName.className = "sf-lobby__selected-name";
-
-    const carHint = document.createElement("div");
-    carHint.className = "sf-lobby__hint";
-    carHint.textContent = "ARROWS CHANGE RIDE";
-
-    this.carSummary.append(carStep, carLabel, this.selectedCarName, carHint);
-
-    leftColumn.append(this.tagFrame, this.carSummary);
-
-    this.garagePanel = document.createElement("section");
-    this.garagePanel.className = "sf-lobby__garage";
-    this.garagePanel.setAttribute("aria-label", "Select your ride");
-
-    const garageTop = document.createElement("div");
-    garageTop.className = "sf-lobby__garage-top";
-
-    const garageTitle = document.createElement("h2");
-    garageTitle.className = "sf-lobby__garage-title";
-    garageTitle.textContent = "SELECT YOUR RIDE";
-
-    const garageMeta = document.createElement("div");
-    garageMeta.className = "sf-lobby__garage-meta";
-    garageMeta.textContent = "BAY 04 / NIGHT RUN";
-
-    garageTop.append(garageTitle, garageMeta);
-
-    this.cardGrid = document.createElement("div");
-    this.cardGrid.className = "sf-lobby__cars";
-    this.cardGrid.setAttribute("role", "radiogroup");
-    this.cardGrid.setAttribute("aria-label", "Car selection");
-
-    for (let index = 0; index < this.cars.length; index += 1) {
-      this.cardGrid.appendChild(this.createCarCard(this.cars[index], index));
-    }
-
-    this.garagePanel.append(garageTop, this.cardGrid);
-    body.append(leftColumn, this.garagePanel);
-
-    const footer = document.createElement("footer");
-    footer.className = "sf-lobby__footer";
-
-    this.confirmButton = document.createElement("button");
-    this.confirmButton.className = "sf-lobby__confirm";
-    this.confirmButton.type = "button";
-    this.confirmButton.innerHTML = '<span>START YOUR ENGINE</span><span class="sf-lobby__confirm-chev">►</span>';
-    this.confirmButton.addEventListener("focus", () => this.setFocus("confirm"));
-    this.confirmButton.addEventListener("click", () => this.confirm());
-
+    // Controls hint
     const controls = document.createElement("div");
     controls.className = "sf-lobby__controls";
-    controls.textContent = "TAB / ARROWS MOVE · ENTER CONFIRMS · ESC IGNORED";
+    controls.textContent = "◀ ▶ SELECT CAR · ENTER START";
 
-    footer.append(this.confirmButton, controls);
-    shell.append(header, body, footer);
-    this.root.appendChild(shell);
+    this.root.append(usernameSection, this.cardsContainer, this.confirmBtn, controls);
     document.body.appendChild(this.root);
-  }
 
-  createCarCard(car, index) {
-    const card = document.createElement("button");
-    card.className = "sf-lobby__car";
-    card.type = "button";
-    card.setAttribute("role", "radio");
-    card.style.setProperty("--car-color", car.color || "#ffc24b");
-    card.style.setProperty("--car-accent", car.accent || "#4be0c8");
-
-    const previewWrap = document.createElement("div");
-    previewWrap.className = "sf-lobby__preview-wrap";
-
-    const canvas = document.createElement("canvas");
-    canvas.className = "sf-lobby__preview";
-    canvas.width = 176;
-    canvas.height = 96;
-    canvas.setAttribute("aria-hidden", "true");
-    this.drawPreview(canvas, car.id);
-    previewWrap.appendChild(canvas);
-
-    const name = document.createElement("div");
-    name.className = "sf-lobby__car-name";
-    name.textContent = car.name;
-
-    const badge = document.createElement("div");
-    badge.className = "sf-lobby__tier";
-    badge.textContent = `${car.tier || "B"}-TIER`;
-
-    const blurb = document.createElement("div");
-    blurb.className = "sf-lobby__blurb";
-    blurb.textContent = car.blurb || "";
-
-    const stats = document.createElement("div");
-    stats.className = "sf-lobby__stats";
-    stats.append(
-      this.createStat("SPEED", car.stats?.speed),
-      this.createStat("ACCEL", car.stats?.accel),
-      this.createStat("BRAKES", car.stats?.brakes),
-      this.createStat("CORNER", car.stats?.cornering),
-      this.createStat("AURA", car.stats?.aura, true),
-    );
-
-    card.append(previewWrap, name, badge, blurb, stats);
-    card.addEventListener("focus", () => {
-      this.selectedIndex = index;
-      this.setFocus("cars");
-      this.updateSelection();
-    });
-    card.addEventListener("mouseenter", () => card.classList.add("sf-lobby__car--hovered"));
-    card.addEventListener("mouseleave", () => card.classList.remove("sf-lobby__car--hovered"));
-    card.addEventListener("click", () => {
-      this.selectedIndex = index;
-      this.setFocus("cars");
-      this.updateSelection();
-    });
-
-    this.cardButtons.push(card);
-    return card;
-  }
-
-  createStat(label, value, isAura = false) {
-    const row = document.createElement("div");
-    row.className = `sf-lobby__stat${isAura ? " sf-lobby__stat--aura" : ""}`;
-
-    const labelEl = document.createElement("span");
-    labelEl.className = "sf-lobby__stat-label";
-    labelEl.textContent = label;
-
-    const bar = document.createElement("span");
-    bar.className = "sf-lobby__stat-bar";
-    bar.setAttribute("aria-label", `${label} ${clampStat(value)} of 10`);
-
-    const filled = clampStat(value);
-    for (let index = 0; index < 10; index += 1) {
-      const segment = document.createElement("span");
-      segment.className = `sf-lobby__stat-seg${index < filled ? " sf-lobby__stat-seg--filled" : ""}`;
-      bar.appendChild(segment);
-    }
-
-    row.append(labelEl, bar);
-    return row;
-  }
-
-  handleTagKey(event) {
-    const key = event.key;
-
-    if (key === "Enter") {
-      this.setFocus("cars", true);
-      return true;
-    }
-
-    if (key === "ArrowDown") {
-      this.setFocus("cars", true);
-      return true;
-    }
-
-    if (key === "ArrowUp") {
-      this.setFocus("confirm", true);
-      return true;
-    }
-
-    if (key === "ArrowLeft" || key === "ArrowRight" || key === "Home" || key === "End") {
-      this.moveTagCursor(key);
-      return true;
-    }
-
-    if (key === "Backspace" || key === "Delete") {
-      this.deleteTagText(key);
-      return true;
-    }
-
-    if (event.metaKey || event.ctrlKey || event.altKey) return true;
-
-    if (key.length === 1 && TAG_CHAR.test(key)) {
-      this.replaceTagSelection(key);
-      return true;
-    }
-
-    return true;
-  }
-
-  handleCarKey(key) {
-    if (key === "ArrowLeft" || key === "a" || key === "A") {
-      this.moveCarSelection(-1);
-      return true;
-    }
-
-    if (key === "ArrowRight" || key === "d" || key === "D") {
-      this.moveCarSelection(1);
-      return true;
-    }
-
-    if (key === "ArrowUp" || key === "w" || key === "W") {
-      this.setFocus("tag", true);
-      return true;
-    }
-
-    if (key === "ArrowDown" || key === "s" || key === "S") {
-      this.setFocus("confirm", true);
-      return true;
-    }
-
-    if (key === "Enter" || key === " " || key === "Spacebar") {
-      this.confirm();
-      return true;
-    }
-
-    return true;
-  }
-
-  handleConfirmKey(key) {
-    if (key === "ArrowUp" || key === "w" || key === "W") {
-      this.setFocus("cars", true);
-      return true;
-    }
-
-    if (key === "ArrowDown" || key === "s" || key === "S") {
-      this.setFocus("tag", true);
-      return true;
-    }
-
-    if (key === "ArrowLeft" || key === "a" || key === "A") {
-      this.setFocus("cars", true);
-      this.moveCarSelection(-1);
-      return true;
-    }
-
-    if (key === "ArrowRight" || key === "d" || key === "D") {
-      this.setFocus("cars", true);
-      this.moveCarSelection(1);
-      return true;
-    }
-
-    if (key === "Enter" || key === " " || key === "Spacebar") {
-      this.confirm();
-      return true;
-    }
-
-    return true;
-  }
-
-  replaceTagSelection(insert) {
-    const input = this.tagInput;
-    const value = input.value || "@";
-    const start = Math.max(1, input.selectionStart ?? value.length);
-    const end = Math.max(1, input.selectionEnd ?? value.length);
-    const next = `${value.slice(0, start)}${insert}${value.slice(end)}`;
-    this.setTag(next, start + insert.length);
-  }
-
-  deleteTagText(key) {
-    const input = this.tagInput;
-    const value = input.value || "@";
-    let start = Math.max(1, input.selectionStart ?? value.length);
-    let end = Math.max(1, input.selectionEnd ?? value.length);
-
-    if (start === end) {
-      if (key === "Backspace" && start > 1) {
-        start -= 1;
-      } else if (key === "Delete" && end < value.length) {
-        end += 1;
-      } else {
-        return;
-      }
-    }
-
-    const next = `${value.slice(0, start)}${value.slice(end)}`;
-    this.setTag(next, start);
-  }
-
-  moveTagCursor(key) {
-    const input = this.tagInput;
-    const value = input.value || "@";
-    const start = input.selectionStart ?? value.length;
-    const end = input.selectionEnd ?? value.length;
-    let cursor = end;
-
-    if (key === "ArrowLeft") cursor = Math.max(1, start - 1);
-    if (key === "ArrowRight") cursor = Math.min(value.length, end + 1);
-    if (key === "Home") cursor = 1;
-    if (key === "End") cursor = value.length;
-
-    this.placeTagCursor(cursor);
-  }
-
-  setTag(value, cursor = null) {
-    const normalized = normalizeTag(value);
-    this.tagInput.value = normalized;
     this.updateConfirmState();
+  }
 
-    if (cursor !== null) {
-      this.placeTagCursor(Math.min(Math.max(1, cursor), normalized.length));
+  renderCards() {
+    this.cardsContainer.replaceChildren();
+    this.cardButtons = [];
+    this.cardCanvases = [];
+
+    for (let i = 0; i < this.cars.length; i++) {
+      const car = this.cars[i];
+      const card = document.createElement("button");
+      card.className = "sf-lobby__card";
+      card.type = "button";
+
+      // Tier badge
+      const tier = document.createElement("div");
+      tier.className = `sf-lobby__card-tier sf-lobby__card-tier--${car.tier || "B"}`;
+      tier.textContent = car.tier || "B";
+
+      // Image area with canvas
+      const imageArea = document.createElement("div");
+      imageArea.className = "sf-lobby__card-image";
+
+      const canvas = document.createElement("canvas");
+      canvas.className = "sf-lobby__card-canvas";
+      canvas.width = 160;
+      canvas.height = 120;
+      this.cardCanvases.push(canvas);
+
+      imageArea.append(tier, canvas);
+
+      // Info section
+      const info = document.createElement("div");
+      info.className = "sf-lobby__card-info";
+
+      const name = document.createElement("h3");
+      name.className = "sf-lobby__card-name";
+      name.textContent = car.name;
+      
+      if (car.edition) {
+        const edition = document.createElement("div");
+        edition.className = "sf-lobby__card-edition";
+        edition.textContent = car.edition;
+        name.appendChild(document.createElement("br"));
+        name.appendChild(edition);
+      }
+
+      const stats = document.createElement("div");
+      stats.className = "sf-lobby__card-stats";
+      stats.appendChild(this.createStatBar("SPD", car.stats?.speed || 5));
+      stats.appendChild(this.createStatBar("ACC", car.stats?.accel || 5));
+      stats.appendChild(this.createStatBar("BRK", car.stats?.brakes || 5));
+      stats.appendChild(this.createStatBar("CRN", car.stats?.cornering || 5));
+      stats.appendChild(this.createStatBar("AUR", car.stats?.aura || 5, true));
+
+      info.append(name, stats);
+      card.append(imageArea, info);
+
+      card.addEventListener("click", () => {
+        this.selectedIndex = i;
+        this.updateSelection();
+      });
+
+      card.addEventListener("focus", () => {
+        this.selectedIndex = i;
+        this.updateSelection();
+      });
+
+      this.cardButtons.push(card);
+      this.cardsContainer.appendChild(card);
+    }
+
+    this.paintCards();
+  }
+
+  paintCards() {
+    for (let i = 0; i < this.cars.length; i++) {
+      const car = this.cars[i];
+      const canvas = this.cardCanvases[i];
+      if (!canvas) continue;
+
+      const ctx = canvas.getContext("2d");
+      const sprite = this.spriteFor(car.id);
+
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      if (!sprite || sprite.width === 0) continue;
+
+      // Draw car sprite centered, rotated to face right
+      ctx.save();
+      ctx.translate(canvas.width / 2, canvas.height / 2);
+      
+      // Subtle bob for selected card
+      const isSelected = i === this.selectedIndex;
+      if (isSelected) {
+        const bob = Math.sin(this.bobPhase * 2) * 3;
+        ctx.translate(0, bob);
+      }
+
+      // Scale up the sprite to fill card nicely
+      const scale = Math.min(canvas.width / sprite.height, canvas.height / sprite.width) * 0.85;
+      ctx.scale(scale, scale);
+      ctx.rotate(-Math.PI / 2); // Face right (car sprites point up by default)
+      ctx.drawImage(sprite, -sprite.width / 2, -sprite.height / 2);
+      ctx.restore();
     }
   }
 
-  normalizeInputFromDom() {
-    const cursor = Math.max(1, this.tagInput.selectionStart ?? this.tagInput.value.length);
-    this.setTag(this.tagInput.value, cursor);
-  }
-
-  placeTagCursor(cursor) {
-    this.tagInput.setSelectionRange(cursor, cursor);
-  }
-
-  moveCarSelection(delta) {
-    if (this.cars.length === 0) return;
-
-    this.selectedIndex = (this.selectedIndex + delta + this.cars.length) % this.cars.length;
-    this.updateSelection();
-    this.focusCurrentZone();
-  }
-
-  cycleFocus(delta) {
-    const current = FOCUS_ORDER.indexOf(this.focusZone);
-    const nextIndex = (current + delta + FOCUS_ORDER.length) % FOCUS_ORDER.length;
-    this.setFocus(FOCUS_ORDER[nextIndex], true);
-  }
-
-  setFocus(zone, shouldFocus = false) {
-    this.focusZone = zone;
-    this.updateFocusState();
-    if (shouldFocus) this.focusCurrentZone();
-  }
-
-  focusCurrentZone() {
-    if (!this.visible) return;
-
-    if (this.focusZone === "tag") {
-      this.tagInput.focus({ preventScroll: true });
-      this.placeTagCursor(this.tagInput.value.length);
-      return;
-    }
-
-    if (this.focusZone === "cars") {
-      this.cardButtons[this.selectedIndex]?.focus({ preventScroll: true });
-      return;
-    }
-
-    this.confirmButton.focus({ preventScroll: true });
-  }
-
-  syncFocusFromTarget(target) {
-    if (target === this.tagInput) {
-      this.setFocus("tag");
-      return;
-    }
-
-    if (target === this.confirmButton) {
-      this.setFocus("confirm");
-      return;
-    }
-
-    const cardIndex = this.cardButtons.indexOf(target);
-    if (cardIndex >= 0) {
-      this.selectedIndex = cardIndex;
-      this.setFocus("cars");
-      this.updateSelection();
-    }
+  startAnimLoop() {
+    const tick = (now) => {
+      this.bobPhase = now * 0.001;
+      if (this.isShown) this.paintCards();
+      this.animFrame = requestAnimationFrame(tick);
+    };
+    this.animFrame = requestAnimationFrame(tick);
   }
 
   updateSelection() {
-    for (let index = 0; index < this.cardButtons.length; index += 1) {
-      const selected = index === this.selectedIndex;
-      const card = this.cardButtons[index];
-      card.classList.toggle("sf-lobby__car--selected", selected);
-      card.setAttribute("aria-checked", String(selected));
-      card.tabIndex = selected ? 0 : -1;
+    for (let i = 0; i < this.cardButtons.length; i++) {
+      const isSelected = i === this.selectedIndex;
+      this.cardButtons[i].classList.toggle("sf-lobby__card--selected", isSelected);
     }
-
-    const car = this.selectedCar;
-    this.selectedCarName.textContent = car ? car.name : "NO CARS FOUND";
+    this.scrollToSelected();
     this.updateConfirmState();
-    this.updateFocusState();
   }
 
-  updateFocusState() {
-    this.root.dataset.focus = this.focusZone;
-    this.tagFrame.classList.toggle("sf-lobby__field--focused", this.focusZone === "tag");
-    this.carSummary.classList.toggle("sf-lobby__field--focused", this.focusZone === "cars");
-    this.garagePanel.classList.toggle("sf-lobby__garage--focused", this.focusZone === "cars");
-    this.confirmButton.classList.toggle("sf-lobby__confirm--focused", this.focusZone === "confirm");
+  scrollToSelected() {
+    const card = this.cardButtons[this.selectedIndex];
+    if (card) {
+      card.scrollIntoView({ behavior: "smooth", inline: "center", block: "nearest" });
+    }
+  }
+
+  moveSelection(delta) {
+    if (this.cars.length === 0) return;
+    this.selectedIndex = (this.selectedIndex + delta + this.cars.length) % this.cars.length;
+    this.updateSelection();
+    this.cardButtons[this.selectedIndex]?.focus();
   }
 
   updateConfirmState() {
     const ready = this.canConfirm();
-    this.confirmButton?.classList.toggle("sf-lobby__confirm--ready", ready);
-    this.confirmButton?.setAttribute("aria-disabled", String(!ready));
-  }
-
-  updateVisibility() {
-    this.root.classList.toggle("sf-lobby--hidden", !this.isShown);
-    this.root.setAttribute("aria-hidden", String(!this.isShown));
+    this.confirmBtn.classList.toggle("sf-lobby__confirm--ready", ready);
   }
 
   canConfirm() {
-    return tagBody(this.tagInput?.value).length >= 2 && Boolean(this.selectedCar);
+    const tag = normalizeTag(this.tagInput.value);
+    return tag.length >= 2 && Boolean(this.selectedCar);
+  }
+
+  createStatBar(label, value, isAura = false) {
+    const row = document.createElement("div");
+    row.className = "sf-lobby__card-stat-row" + (isAura ? " sf-lobby__card-stat-row--aura" : "");
+    
+    const lbl = document.createElement("span");
+    lbl.className = "sf-lobby__card-stat-label";
+    lbl.textContent = label;
+    
+    const bar = document.createElement("div");
+    bar.className = "sf-lobby__card-stat-bar";
+    
+    const filled = Math.min(10, Math.max(0, Math.round(value)));
+    for (let i = 0; i < 10; i++) {
+      const seg = document.createElement("span");
+      seg.className = "sf-lobby__card-stat-seg" + (i < filled ? " sf-lobby__card-stat-seg--on" : "");
+      bar.appendChild(seg);
+    }
+    
+    row.append(lbl, bar);
+    return row;
   }
 
   confirm() {
     if (!this.canConfirm()) {
-      if (tagBody(this.tagInput.value).length < 2) {
-        this.shake(this.tagFrame);
-        this.setFocus("tag", true);
-      } else {
-        this.shake(this.garagePanel);
-        this.setFocus("cars", true);
+      if (normalizeTag(this.tagInput.value).length < 2) {
+        this.tagInput.classList.add("sf-lobby--shake");
+        this.tagInput.focus();
+        setTimeout(() => this.tagInput.classList.remove("sf-lobby--shake"), 300);
       }
       return;
     }
 
     this.onComplete({
-      tag: normalizeTag(this.tagInput.value),
+      tag: `@${normalizeTag(this.tagInput.value)}`,
       carId: this.selectedCar.id,
     });
-  }
-
-  shake(element) {
-    element.classList.remove("sf-lobby--shake");
-    void element.offsetWidth;
-    element.classList.add("sf-lobby--shake");
-    window.setTimeout(() => element.classList.remove("sf-lobby--shake"), 360);
   }
 }

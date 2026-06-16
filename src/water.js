@@ -94,6 +94,25 @@ export function isWater(x, y, shore, bridgeZones) {
   return false;
 }
 
+// Conservative water check for car death - only triggers in obvious water areas
+// (far from any roads, clearly in the bay)
+export function isDeepWater(x, y) {
+  // Only check the main bay/ocean rectangles with some margin
+  // These are areas where there are definitely no roads
+  const DEEP_WATER = [
+    { minX: -5000, maxX: 7000, minY: -7000, maxY: -4200 },   // North bay (well away from shore)
+    { minX: 2200, maxX: 7000, minY: -4200, maxY: 2500 },     // East bay (well away from shore)
+    { minX: -7000, maxX: -3000, minY: -7000, maxY: 1500 },   // Pacific (well away from shore)
+  ];
+  
+  for (const r of DEEP_WATER) {
+    if (x >= r.minX && x <= r.maxX && y >= r.minY && y <= r.maxY) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function pointInPoly(p, x, y) {
   let inside = false;
   for (let i = 0, j = p.length - 2; i < p.length; j = i, i += 2) {

@@ -286,6 +286,14 @@ function handleBusted() {
 
 let waterDeathCooldown = false;
 
+// Safe spawn points on land (not near water)
+const SAFE_SPAWNS = [
+  { x: 2647, y: -3340 },  // Chinatown
+  { x: 911, y: 2200 },    // South SF
+  { x: -500, y: 500 },    // West SF
+  { x: 1500, y: -1000 },  // Downtown
+];
+
 function handleWaterDeath() {
   if (waterDeathCooldown) return;
   waterDeathCooldown = true;
@@ -295,6 +303,12 @@ function handleWaterDeath() {
   car.vy = 0;
   
   setTimeout(() => {
+    // Teleport to a random safe spawn on land
+    const spawn = SAFE_SPAWNS[Math.floor(Math.random() * SAFE_SPAWNS.length)];
+    car.x = spawn.x;
+    car.y = spawn.y;
+    car.vx = 0;
+    car.vy = 0;
     car.resetToRoad();
     waterDeathCooldown = false;
   }, 1500);

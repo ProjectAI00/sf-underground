@@ -17,7 +17,7 @@ import { Radio } from "./radio.js";
 import { Multiplayer, makeRoomCode } from "./multiplayer.js";
 import { RemotePlayers } from "./remote-players.js";
 import { elevOffset } from "./terrain.js";
-import { isDeepWater } from "./water.js";
+
 import { Police } from "./police.js";
 import { SpeedZones } from "./speedzone.js";
 import { Intro, introComplete, resetIntro } from "./intro.js";
@@ -541,10 +541,7 @@ function tick(dt, now) {
   if (!paused && roaming) {
     car.update(dt, input);
     
-    // Check if car drove into deep water (bay/ocean)
-    if (isDeepWater(car.x, car.y)) {
-      handleWaterDeath();
-    }
+
     
     traffic.update(dt, car, updateViewR);
     const pedHitsBefore = peds.hitCount;

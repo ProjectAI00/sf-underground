@@ -147,10 +147,11 @@
 }
 
 .sf-menu__main-list--horizontal .sf-menu__item {
-  display: flex;
+  display: flex !important;
+  grid-template-columns: none !important;
   width: 100%;
   min-height: 60px;
-  flex-direction: row;
+  flex-direction: row !important;
   align-items: center;
   justify-content: space-between;
   gap: 16px;
@@ -175,11 +176,12 @@
 }
 
 .sf-menu__main-list--horizontal .sf-menu__item-label {
-  font-size: 16px;
-  white-space: nowrap;
-  text-align: left;
-  overflow: visible;
-  text-overflow: unset;
+  font-size: 16px !important;
+  white-space: nowrap !important;
+  text-align: left !important;
+  overflow: visible !important;
+  text-overflow: clip !important;
+  flex-shrink: 0 !important;
 }
 
 .sf-menu__main-list--horizontal .sf-menu__item-meta {

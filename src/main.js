@@ -17,6 +17,7 @@ import { Radio } from "./radio.js";
 import { Multiplayer, makeRoomCode } from "./multiplayer.js";
 import { RemotePlayers } from "./remote-players.js";
 import { elevOffset } from "./terrain.js";
+import { isWater } from "./water.js";
 import { Police } from "./police.js";
 import { SpeedZones } from "./speedzone.js";
 import { Intro, introComplete, resetIntro } from "./intro.js";
@@ -283,6 +284,16 @@ function handleBusted() {
   }
 }
 
+function handleWaterDeath() {
+  showMsg("YOU SANK", 2000, "#4be0c8");
+  car.vx = 0;
+  car.vy = 0;
+  
+  setTimeout(() => {
+    car.resetToRoad();
+  }, 1500);
+}
+
 function startMultiplayer(roomCode) {
   const room = roomCode || makeRoomCode();
   if (mp) mp.disconnect();
@@ -509,6 +520,12 @@ function tick(dt, now) {
 
   if (!paused && roaming) {
     car.update(dt, input);
+    
+    // Check if car drove into water
+    if (isWater(car.x, car.y, world.overview.shore, world.overview.bridgeWater)) {
+      handleWaterDeath();
+    }
+    
     traffic.update(dt, car, updateViewR);
     const pedHitsBefore = peds.hitCount;
     peds.update(dt, car);

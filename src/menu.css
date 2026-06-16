@@ -48,9 +48,7 @@
   inset: 0;
   z-index: 1;
   pointer-events: none;
-  background: 
-    rgba(0, 0, 0, 0.7),
-    radial-gradient(ellipse at center, transparent 48%, rgba(0, 0, 0, 0.58) 100%);
+  background: rgba(0, 0, 0, 0.85);
 }
 
 .sf-menu--hidden {
@@ -84,28 +82,26 @@
 
 .sf-menu__logo-sf {
   color: var(--sf-menu-magenta);
-  font-size: clamp(48px, 12vw, 140px);
+  font-size: clamp(32px, 8vw, 80px);
   line-height: 0.9;
-  letter-spacing: clamp(4px, 2vw, 12px);
+  letter-spacing: clamp(2px, 1vw, 6px);
   text-shadow:
-    0 0 40px rgba(255, 41, 117, 0.8),
-    0 0 80px rgba(255, 41, 117, 0.5),
-    8px 8px 0 #1a0812,
-    -4px 4px 0 rgba(0,255,249,0.3),
-    4px -4px 0 rgba(255,41,117,0.3);
+    0 0 30px rgba(255, 41, 117, 0.8),
+    0 0 60px rgba(255, 41, 117, 0.5),
+    4px 4px 0 #1a0812;
   animation: sf-menu-glitch 4s ease-in-out infinite;
 }
 
 .sf-menu__logo-underground {
-  margin-top: 8px;
+  margin-top: 4px;
   color: var(--sf-menu-cyan);
-  font-size: clamp(28px, 6vw, 72px);
+  font-size: clamp(18px, 4vw, 40px);
   line-height: 1.1;
-  letter-spacing: 8px;
+  letter-spacing: 4px;
   text-shadow:
-    0 0 30px rgba(0, 255, 249, 0.8),
-    0 0 60px rgba(0, 255, 249, 0.4),
-    4px 4px 0 #000;
+    0 0 20px rgba(0, 255, 249, 0.8),
+    0 0 40px rgba(0, 255, 249, 0.4),
+    2px 2px 0 #000;
 }
 
 .sf-menu__tagline {
@@ -151,16 +147,17 @@
 }
 
 .sf-menu__main-list--horizontal .sf-menu__item {
+  display: flex;
   width: 100%;
-  min-height: 70px;
+  min-height: 60px;
   flex-direction: row;
   align-items: center;
   justify-content: space-between;
   gap: 16px;
-  padding: 18px 24px;
+  padding: 16px 24px;
   border: 2px solid rgba(255, 41, 117, 0.3);
   border-radius: 4px;
-  background: rgba(0, 0, 0, 0.85);
+  background: rgba(0, 0, 0, 0.9);
   transform: translateY(0);
   backdrop-filter: blur(4px);
 }
@@ -178,10 +175,11 @@
 }
 
 .sf-menu__main-list--horizontal .sf-menu__item-label {
-  font-size: clamp(14px, 2.5vw, 20px);
+  font-size: 16px;
   white-space: nowrap;
   text-align: left;
-  flex: 1;
+  overflow: visible;
+  text-overflow: unset;
 }
 
 .sf-menu__main-list--horizontal .sf-menu__item-meta {

@@ -284,13 +284,19 @@ function handleBusted() {
   }
 }
 
+let waterDeathCooldown = false;
+
 function handleWaterDeath() {
+  if (waterDeathCooldown) return;
+  waterDeathCooldown = true;
+  
   showMsg("YOU SANK", 2000, "#4be0c8");
   car.vx = 0;
   car.vy = 0;
   
   setTimeout(() => {
     car.resetToRoad();
+    waterDeathCooldown = false;
   }, 1500);
 }
 

@@ -1,5 +1,11 @@
 {
   "name": "retro-racer-sf",
   "private": true,
-  "description": "Retro Racer SF — top-down street racer on real San Francisco roads"
+  "description": "Retro Racer SF — top-down street racer on real San Francisco roads",
+  "devDependencies": {
+    "@gradio/client": "^2.2.2",
+    "@huggingface/inference": "^4.13.18",
+    "canvas": "^3.2.3",
+    "replicate": "^1.4.0"
+  }
 }

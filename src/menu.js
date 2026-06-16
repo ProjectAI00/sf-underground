@@ -299,9 +299,17 @@ export class Menu {
     });
 
     this.addItem(this.mainList, {
+      label: "STORY MODE",
+      meta: "COMING SOON",
+      action: () => {},
+      disabled: true,
+    });
+
+    this.addItem(this.mainList, {
       label: "MULTIPLAYER",
-      meta: "JOIN / CREATE ROOM",
-      action: () => this.showMultiplayer(),
+      meta: "COMING SOON",
+      action: () => {},
+      disabled: true,
     });
 
     this.clampSelection();
@@ -359,13 +367,15 @@ export class Menu {
     this.clampSelection();
   }
 
-  addItem(parent, { label, meta, action }) {
+  addItem(parent, { label, meta, action, disabled = false }) {
     const index = this.items.length;
     const button = document.createElement("button");
     button.className = "sf-menu__item";
+    if (disabled) button.classList.add("sf-menu__item--disabled");
     button.type = "button";
     button.setAttribute("role", "menuitem");
     button.setAttribute("aria-selected", "false");
+    if (disabled) button.setAttribute("aria-disabled", "true");
 
     const chevron = document.createElement("span");
     chevron.className = "sf-menu__chevron";
@@ -386,13 +396,13 @@ export class Menu {
       this.updateSelection();
     });
     button.addEventListener("click", () => {
-      if ((this.mode === "main" && this.loading) || this.mode === "room") return;
+      if ((this.mode === "main" && this.loading) || this.mode === "room" || disabled) return;
       this.selection = index;
       this.activateSelection();
     });
 
     parent.appendChild(button);
-    this.items.push({ button, action });
+    this.items.push({ button, action, disabled });
   }
 
   moveSelection(delta) {
@@ -403,7 +413,7 @@ export class Menu {
 
   activateSelection() {
     const item = this.items[this.selection];
-    if (!item) return;
+    if (!item || item.disabled) return;
     item.action();
   }
 

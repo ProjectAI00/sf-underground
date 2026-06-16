@@ -257,6 +257,18 @@
   color: #cdbb95;
 }
 
+.sf-menu__item--disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.sf-menu__item--disabled:hover,
+.sf-menu__item--disabled.sf-menu__item--selected {
+  transform: none;
+  background: none;
+  color: inherit;
+}
+
 .sf-menu__footer {
   margin-top: 40px;
   color: rgba(255, 255, 255, 0.5);

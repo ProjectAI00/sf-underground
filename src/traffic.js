@@ -10,6 +10,8 @@ const WAYMO_CHANCE = 0.10;
 let waymoSprite = null;
 
 function getTrafficTarget() {
+  // No traffic during intro cinematic
+  if (globalThis.__introNoTraffic) return 0;
   // Intro boost for more cars on road during tutorial
   if (globalThis.__introTrafficBoost) return Math.floor(BASE_TARGET_CARS * 1.6);
   

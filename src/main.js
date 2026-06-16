@@ -21,6 +21,11 @@ import { Police } from "./police.js";
 import { SpeedZones } from "./speedzone.js";
 import { Intro, introComplete, resetIntro } from "./intro.js";
 
+// ?tutorial forces intro replay
+if (new URLSearchParams(window.location.search).has("tutorial")) {
+  resetIntro();
+}
+
 const canvas = document.getElementById("game");
 const ctx = canvas.getContext("2d");
 const menuBgCanvas = document.getElementById("menu-bg");
@@ -69,6 +74,7 @@ let state = "boot"; // boot | intro | lobby | menu | roam | paused
 let camRotate = true;
 let world, renderer, car, traffic, race, radar, props, peds, menu, lobby, cityMap, police, speedZones, intro;
 const radio = new Radio();
+globalThis.__radio = radio;
 let mp = null;
 let remotePlayers = null;
 let mpRoom = null;
@@ -80,7 +86,13 @@ let prevSpeed = 0; // For detecting acceleration
 let flyMode = false, flyCam = { x: 0, y: 0, zoom: 3 };
 let frame = 0;
 let profile = null;
-try { profile = JSON.parse(localStorage.getItem("sfracer_profile") || "null"); } catch { /* fresh start */ }
+// Don't auto-fill profile - start fresh each time (but keep car selection etc)
+try { 
+  const saved = JSON.parse(localStorage.getItem("sfracer_profile") || "null");
+  if (saved) {
+    profile = { ...saved, tag: "" }; // Clear the name but keep other settings
+  }
+} catch { /* fresh start */ }
 let fpsVisible = false, fpsFrames = 0, fpsLast = performance.now();
 let timeOverrideIdx = 0; // 0=auto, 1=real, then forced hours for N key
 const TIME_OVERRIDES = ["auto", null, 22.5, 20.2, 6.8, 12, 7];
@@ -118,7 +130,8 @@ window.addEventListener("keydown", (e) => {
     fpsVisible = !fpsVisible;
     ui.fps.style.display = fpsVisible ? "block" : "none";
   }
-  if (KEYS[e.code] !== undefined) {
+  // Don't intercept game controls when typing in lobby input
+  if (KEYS[e.code] !== undefined && !(lobby?.visible && document.activeElement?.tagName === "INPUT")) {
     input[KEYS[e.code]] = true;
     e.preventDefault();
   }
@@ -216,9 +229,18 @@ function startFreeRoam() {
   mpRoom = null;
   if (remotePlayers) remotePlayers.clear();
   race.stop();
-  state = "roam";
   menu.hide();
-  radio.playSessionPlaylist().catch(() => {});
+  
+  const forceTutorial = window.location.search.includes("tutorial");
+  if (forceTutorial || !introComplete()) {
+    // Need to play intro first
+    state = "intro";
+    intro.start(car);
+  } else {
+    // Intro done, go to lobby
+    state = "lobby";
+    lobby.show();
+  }
 }
 
 function handleBusted() {
@@ -296,6 +318,8 @@ function hasValidProfile(p) {
 
 async function init() {
   try {
+
+  
   world = await loadWorld();
   renderer = new Renderer(world, canvas);
   race = new Race(world);
@@ -361,7 +385,8 @@ async function init() {
   });
   document.getElementById("minimap").style.cursor = "pointer";
   document.getElementById("minimap").addEventListener("click", () => {
-    if (state === "roam" || state === "paused") cityMap.toggle();
+    const introWithControl = state === "intro" && intro?.hasPlayerControl();
+    if (state === "roam" || state === "paused" || introWithControl) cityMap.toggle();
   });
 
   lobby = new Lobby({
@@ -372,8 +397,8 @@ async function init() {
       localStorage.setItem("sfracer_profile", JSON.stringify(p));
       applyProfile();
       lobby.hide();
-      state = "menu";
-      menu.showMain({ loading: false });
+      state = "roam";
+      radio.playSessionPlaylist().catch(() => {});
     },
   });
   preloadAllCarSprites(CARS.map((c) => c.id));
@@ -390,7 +415,10 @@ async function init() {
     { x: 2800, y: -680, h: 1.57 },     // SOMA
     { x: -350, y: -3950, h: 0 },       // Marina
   ];
-  const s = SPAWNS[Math.floor(Math.random() * SPAWNS.length)];
+  // If intro will play, spawn at intro scene location so world loads there
+  const forceTutorial = window.location.search.includes("tutorial");
+  const willPlayIntro = forceTutorial || !introComplete();
+  const s = willPlayIntro ? { x: 911, y: 2200, h: 3.064 } : SPAWNS[Math.floor(Math.random() * SPAWNS.length)];
   car = new Car(world, s.x, s.y, s.h);
   applyProfile();
   world.update(car.x, car.y);
@@ -446,8 +474,8 @@ function tick(dt, now) {
   world.update(worldTarget.x, worldTarget.y);
   updateWeather(dt, car?.speed() || 0);
   
-  // Auto time cycling (when in auto mode)
-  if (TIME_OVERRIDES[timeOverrideIdx] === "auto") {
+  // Auto time cycling (when in auto mode) - skip during intro which forces its own time
+  if (TIME_OVERRIDES[timeOverrideIdx] === "auto" && state !== "intro") {
     autoTimeHour += (dt / 60) * autoTimeSpeed; // Convert dt to minutes, then apply speed
     if (autoTimeHour >= 24) autoTimeHour -= 24;
     globalThis.__forceHour = autoTimeHour;
@@ -455,17 +483,9 @@ function tick(dt, now) {
 
   if (state === "boot") {
     if (world.ready(car.x, car.y, 350)) {
-      // Check if intro needs to play
-      if (!introComplete()) {
-        menu.hide();
-        state = "intro";
-        intro.start(car);
-      } else {
-        // Skip to lobby (name + car pick)
-        menu.hide();
-        state = "lobby";
-        lobby.show();
-      }
+      // Loading done - show main menu
+      state = "menu";
+      menu.showMain({ loading: false });
     }
   }
   

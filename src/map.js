@@ -565,6 +565,9 @@ export class CityMap {
   }
   
   #drawLocations(g, w, h, z) {
+    // Hide all locations during intro mission
+    if (globalThis.__introActive) return;
+    
     const toScreen = (x, y) => ({
       x: w / 2 + (x - this.centerX) * z,
       y: h / 2 + (y - this.centerY) * z

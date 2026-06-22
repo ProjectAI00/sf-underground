@@ -83,6 +83,61 @@ for (const el of loadRaw("roads")) {
 }
 console.log(`  ${roads.length} road pieces (${fullRoads.length} ways)`);
 
+// ---------- road graph (from raw OSM node refs, before chopping) ----------
+console.log("road graph...");
+const osmToNode = new Map();
+const graphNodes = [];
+const graphEdges = [];
+const edgeSeen = new Set();
+
+function graphNode(osmId, x, y) {
+  let idx = osmToNode.get(osmId);
+  if (idx === undefined) {
+    idx = graphNodes.length;
+    osmToNode.set(osmId, idx);
+    graphNodes.push([Math.round(x * 10) / 10, Math.round(y * 10) / 10]);
+  }
+  return idx;
+}
+
+function addGraphEdge(from, to, len, r, ow) {
+  if (from === to || len < 0.5) return;
+  const fwd = `${from},${to}`;
+  if (!edgeSeen.has(fwd)) {
+    edgeSeen.add(fwd);
+    graphEdges.push([from, to, Math.round(len * 10) / 10, r, ow ? 1 : 0]);
+  }
+  if (!ow) {
+    const rev = `${to},${from}`;
+    if (!edgeSeen.has(rev)) {
+      edgeSeen.add(rev);
+      graphEdges.push([to, from, Math.round(len * 10) / 10, r, 0]);
+    }
+  }
+}
+
+for (const el of loadRaw("roads")) {
+  if (el.type !== "way" || !el.geometry || !el.nodes) continue;
+  const hw = el.tags?.highway;
+  if (!ROAD_W[hw]) continue;
+  const geom = el.geometry;
+  const ids = el.nodes;
+  if (geom.length !== ids.length || geom.length < 2) continue;
+  const r = ROAD_RANK[hw] ?? 0;
+  const ow = el.tags?.oneway === "yes" ? 1 : el.tags?.oneway === "-1" ? -1 : 0;
+  for (let i = 0; i + 1 < ids.length; i++) {
+    const x0 = px(geom[i].lon), y0 = py(geom[i].lat);
+    const x1 = px(geom[i + 1].lon), y1 = py(geom[i + 1].lat);
+    const a = graphNode(ids[i], x0, y0);
+    const b = graphNode(ids[i + 1], x1, y1);
+    const len = Math.hypot(x1 - x0, y1 - y0);
+    if (ow === 1) addGraphEdge(a, b, len, r, 1);
+    else if (ow === -1) addGraphEdge(b, a, len, r, 1);
+    else addGraphEdge(a, b, len, r, 0);
+  }
+}
+console.log(`  ${graphNodes.length} nodes, ${graphEdges.length} edges`);
+
 // segment grid for nearest-road lookups
 const segGrid = new Map();
 const SEG_CELL = 50;
@@ -462,4 +517,10 @@ writeFileSync(join(ROOT, "data", "overview.json"), JSON.stringify({
   roads: ovRoads,
   circuits,
 }));
+
+writeFileSync(join(ROOT, "data", "road-graph.json"), JSON.stringify({
+  nodes: graphNodes,
+  edges: graphEdges,
+}));
+console.log(`  road-graph.json: ${graphNodes.length} nodes, ${graphEdges.length} edges`);
 console.log("done.");

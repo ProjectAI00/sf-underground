@@ -314,7 +314,9 @@ export class Radar {
       return this.cachedRoute;
     }
     
-    this.cachedRoute = this.#findRoute(car.x, car.y, waypoint.x, waypoint.y);
+    this.cachedRoute = this.world.roadGraph
+      ? this.world.roadGraph.findRoute(car.x, car.y, waypoint.x, waypoint.y)
+      : this.#findRouteLegacy(car.x, car.y, waypoint.x, waypoint.y);
     this.cachedWaypoint = wpKey;
     this.cachedCarPos = { x: car.x, y: car.y };
     return this.cachedRoute;
@@ -339,7 +341,7 @@ export class Radar {
     }
   }
   
-  #findRoute(startX, startY, endX, endY) {
+  #findRouteLegacy(startX, startY, endX, endY) {
     const W = this.world;
     const startRoad = W.nearestRoad(startX, startY, 100);
     const endRoad = W.nearestRoad(endX, endY, 100);

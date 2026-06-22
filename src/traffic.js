@@ -1,8 +1,10 @@
 // Chunk-streamed ambient traffic around the player. Cars keep only a road
 // reference and arclength, so the active set scales with nearby streets.
+// Civilian driving: spline follow, corner slowdown, one-way, no drift/race AI.
 
 import { makeCarSprite, makeWaymoSprite, drawCarSprite, drawHeadlightBeams } from "./car.js";
 import { elevOffset } from "./terrain.js";
+import { cornerSpeedMul, distToEnd, headingAt } from "./traffic-drive.js";
 
 const COLORS = ["#c9c3b4", "#5d7a8e", "#8a6f55", "#d9b04a", "#a8443c", "#d9b04a", "#6e7d5a", "#7a5d80", "#3a3a42", "#e8e4d8", "#6b4423", "#2d4a5e"];
 const BASE_TARGET_CARS = 50;  // reduced from 90 for performance
@@ -57,6 +59,7 @@ export class Traffic {
     }
 
     this.#spawnNear(player);
+    this.#applyCivilDriving(dt);
     this.#applySpacing(dt);
 
     for (const c of this.cars) {
@@ -89,12 +92,13 @@ export class Traffic {
       }
 
       pointAt(c.road.p, c.s, c.pos);
-      // Stay in correct lane based on direction (right-hand traffic)
       const laneOff = c.road.w * 0.22 * c.dir;
       const tx = c.pos.tx * c.dir, ty = c.pos.ty * c.dir;
       c.x = c.pos.x + -c.pos.ty * laneOff;
       c.y = c.pos.y + c.pos.tx * laneOff;
-      c.h += angDiff(Math.atan2(ty, tx), c.h) * Math.min(1, 8 * dt);
+      const lookS = Math.max(0, Math.min(c.len, c.s + c.dir * (6 + c.v * 0.15)));
+      const targetH = headingAt(c.road.p, lookS, c.dir);
+      c.h += angDiff(targetH, c.h) * Math.min(1, 4.5 * dt);
 
       const dx = player.x - c.x, dy = player.y - c.y;
       const d2 = dx * dx + dy * dy;
@@ -205,7 +209,7 @@ export class Traffic {
       const car = {
         road, len, s, dir, x, y,
         h: Math.atan2(ty, tx),
-        v: baseV, baseV, stopT: 0,
+        v: baseV, baseV, stopT: 0, yieldT: 0,
         sprite: isWaymo ? this.#waymoSprite() : this.#sprite(spriteIndex),
         isWaymo,
         pos: { x: this.tmp.x, y: this.tmp.y, tx: this.tmp.tx, ty: this.tmp.ty },
@@ -235,7 +239,11 @@ export class Traffic {
       // Larger connection threshold (15m = 225 sq)
       const connectsStart = ds < 225, connectsEnd = de < 225;
       if (!connectsStart && !connectsEnd) continue;
-      if (r === c.road) continue; // never U-turn on same road
+      if (r === c.road) continue;
+      // One-way: must enter from correct end
+      if (r.ow) {
+        if (connectsEnd && !connectsStart) continue;
+      }
       
       // Collect all candidates with their distances
       const minDist = Math.min(connectsStart ? ds : Infinity, connectsEnd ? de : Infinity);
@@ -249,11 +257,19 @@ export class Traffic {
       return;
     }
     
-    // Sort by distance and pick randomly from top candidates (prefer closer but add variety)
-    candidates.sort((a, b) => a.minDist - b.minDist);
-    const pickFrom = Math.min(candidates.length, 3); // pick from top 3 closest
-    const pick = candidates[Math.floor(Math.random() * pickFrom)];
-    
+    // Prefer continuing straight-ish; slight randomness among good options
+    const inH = Math.atan2(c.dir * (atStart ? p[3] - p[1] : p[p.length - 1] - p[p.length - 3]),
+      c.dir * (atStart ? p[2] - p[0] : p[p.length - 2] - p[p.length - 4]));
+    for (const cand of candidates) {
+      const q = cand.r.p;
+      const fwdH = cand.connectsStart && (!cand.connectsEnd || cand.ds <= cand.de)
+        ? Math.atan2(q[3] - q[1], q[2] - q[0])
+        : Math.atan2(q[q.length - 1] - q[q.length - 3], q[q.length - 2] - q[q.length - 4]);
+      cand.align = Math.cos(fwdH - inH);
+    }
+    candidates.sort((a, b) => (b.align - a.align) || (a.minDist - b.minDist));
+    const top = candidates.filter((cand) => cand.align >= candidates[0].align - 0.15).slice(0, 3);
+    const pick = top[(Math.random() * top.length) | 0];
     next = pick.r;
     // Determine direction: enter from the end that's closest
     if (pick.connectsStart && pick.connectsEnd) {
@@ -264,13 +280,44 @@ export class Traffic {
     
     c.road = next;
     c.len = polyLen(next.p);
-    if (nextAtStart) { c.s = 0.1; c.dir = 1; }
-    else { c.s = c.len - 0.1; c.dir = -1; }
+    if (next.ow) {
+      c.s = 0.1;
+      c.dir = 1;
+    } else if (nextAtStart) {
+      c.s = 0.1;
+      c.dir = 1;
+    } else {
+      c.s = c.len - 0.1;
+      c.dir = -1;
+    }
+    if (pick.align < 0.35) c.yieldT = Math.max(c.yieldT, 0.5);
+  }
+
+  /** Corner slowdown + junction yield — sets c.driveV target only. */
+  #applyCivilDriving(dt) {
+    for (const c of this.cars) {
+      if (c.stopT > 0) { c.driveV = 0; continue; }
+
+      let target = c.baseV;
+      target *= cornerSpeedMul(c.road.p, c.s, c.dir, c.v);
+
+      const endD = distToEnd(c.len, c.s, c.dir);
+      if (endD < 14) target = Math.min(target, c.baseV * (0.45 + endD / 28));
+
+      if (c.yieldT > 0) {
+        c.yieldT -= dt;
+        target = Math.min(target, 4 + c.baseV * 0.25);
+      }
+
+      if (c.isWaymo) target = Math.min(target, c.baseV * 0.92);
+
+      c.driveV = target;
+    }
   }
 
   #applySpacing(dt) {
     for (const c of this.cars) {
-      let target = c.stopT > 0 ? 0 : c.baseV;
+      let target = c.stopT > 0 ? 0 : (c.driveV ?? c.baseV);
       const fx = Math.cos(c.h), fy = Math.sin(c.h);
 
       for (const o of this.cars) {

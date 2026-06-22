@@ -639,6 +639,25 @@ export class CityMap {
   #drawWaypoint(g, w, h, z) {
     const wp = this.api.getWaypoint();
     if (!wp) return;
+
+    const player = this.api.getPlayer();
+    const route = player && this.world.roadGraph
+      ? this.world.roadGraph.findRoute(player.x, player.y, wp.x, wp.y)
+      : null;
+
+    if (route && route.length >= 2) {
+      g.strokeStyle = AMBER + "cc";
+      g.lineWidth = 3;
+      g.lineCap = "round";
+      g.lineJoin = "round";
+      g.beginPath();
+      const first = { x: w / 2 + (route[0].x - this.centerX) * z, y: h / 2 + (route[0].y - this.centerY) * z };
+      g.moveTo(first.x, first.y);
+      for (let i = 1; i < route.length; i++) {
+        g.lineTo(w / 2 + (route[i].x - this.centerX) * z, h / 2 + (route[i].y - this.centerY) * z);
+      }
+      g.stroke();
+    }
     
     const sx = w / 2 + (wp.x - this.centerX) * z;
     const sy = h / 2 + (wp.y - this.centerY) * z;

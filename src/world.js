@@ -2,6 +2,8 @@
 // Chunks (1km squares, see tools/process_sf.mjs) are fetched as the player
 // moves; features register into global spatial grids used by every system.
 
+import { loadRoadGraph } from "./road-graph.js";
+
 const CELL = 64; // meters, spatial hash cell
 const LOAD_RADIUS = 1600;
 const MAX_CONCURRENT = 4;
@@ -9,7 +11,10 @@ const MAX_CONCURRENT = 4;
 function key(cx, cy) { return cx + "," + cy; }
 
 export async function loadWorld() {
-  const overview = await (await fetch("data/overview.json")).json();
+  const [overview, roadGraph] = await Promise.all([
+    (await fetch("data/overview.json")).json(),
+    loadRoadGraph(),
+  ]);
   try {
     const land = await (await fetch("data/map_land.json")).json();
     overview.parks = land.parks || overview.parks || [];
@@ -24,12 +29,13 @@ export async function loadWorld() {
     overview.shore = overview.shore || [];
     overview.bridgeWater = overview.bridgeWater || [];
   }
-  return new World(overview);
+  return new World(overview, roadGraph);
 }
 
 export class World {
-  constructor(overview) {
+  constructor(overview, roadGraph = null) {
     this.overview = overview;
+    this.roadGraph = roadGraph;
     this.chunkSize = overview.chunk || 1000;
     this.circuits = overview.circuits || [];
     this.segGrid = new Map();   // cell -> [{road, si}]

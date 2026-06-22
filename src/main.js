@@ -21,6 +21,9 @@ import { elevOffset } from "./terrain.js";
 import { Police } from "./police.js";
 import { SpeedZones } from "./speedzone.js";
 import { Intro, introComplete, resetIntro } from "./intro.js";
+import { Rival } from "./rival.js";
+import { MISSIONS, campaignProgress, markBeaten } from "./campaign.js";
+import { routeAimPoint } from "./local-driver.js";
 
 // ?tutorial forces intro replay
 if (new URLSearchParams(window.location.search).has("tutorial")) {
@@ -44,6 +47,22 @@ const ui = {
   bustedFill: document.getElementById("busted-bar-fill"),
   bustedText: document.getElementById("busted-text"),
 };
+
+function startCircuitRace(circuit) {
+  race.start(circuit, car);
+  const prog = campaignProgress();
+  const mission = MISSIONS.find((m) => m.circuit === circuit.id && m.id >= prog)
+    || MISSIONS.find((m) => m.circuit === circuit.id)
+    || MISSIONS[0];
+  rival = new Rival(world, mission, circuit);
+  rival.start();
+  showMsg(mission.title || circuit.label, 2200, "#4be0c8");
+}
+
+function stopRace() {
+  if (race) race.stop();
+  rival = null;
+}
 
 function resize() {
   canvas.width = window.innerWidth;
@@ -80,6 +99,7 @@ let mp = null;
 let remotePlayers = null;
 let mpRoom = null;
 let waypoint = null;
+let rival = null;
 let camRot = 0, camZoom = 7.0;
 let shakeT = 0;
 let camLift = 0; // Camera pull-back on acceleration
@@ -102,7 +122,7 @@ globalThis.__forceHour = null; // Start with auto
 let autoTimeHour = 6; // Start at dawn for auto mode
 let autoTimeSpeed = 0.5; // Hours per real minute (30 min = full day cycle)
 
-window.__game = () => ({ world, car, props, traffic, peds, race, cityMap, waypoint, mp, remotePlayers, police, speedZones, intro });
+window.__game = () => ({ world, car, props, traffic, peds, race, cityMap, waypoint, mp, remotePlayers, police, speedZones, intro, rival });
 window.__go = {
   roam: () => { lobby.hide(); startFreeRoam(); },
   mp: (room) => { lobby.hide(); startMultiplayer(room || makeRoomCode()); },
@@ -229,7 +249,7 @@ function startFreeRoam() {
   if (mp) mp.disconnect();
   mpRoom = null;
   if (remotePlayers) remotePlayers.clear();
-  race.stop();
+  stopRace();
   menu.hide();
   
   const forceTutorial = window.location.search.includes("tutorial");
@@ -255,9 +275,9 @@ function handleBusted() {
   police.setWanted(0);
   police.resetBoxed();
   
-  if (race.state === "racing") {
+  if (race.state === "running" || race.state === "countdown") {
     // In a race - lose the race
-    race.stop();
+    stopRace();
     showMsg("BUSTED - RACE LOST", 3000, "#ff4f5e");
   } else if (mpRoom) {
     // In multiplayer - temporarily kicked, respawn after delay
@@ -324,7 +344,7 @@ function startMultiplayer(roomCode) {
   globalThis.__forceHour = null;
   globalThis.__weather?.set("clear");
 
-  race.stop();
+  stopRace();
   state = "roam";
   menu.hide();
   mpRoom = room;
@@ -395,7 +415,7 @@ async function init() {
       if (mp) mp.disconnect();
       mpRoom = null;
       if (remotePlayers) remotePlayers.clear();
-      race.stop();
+      stopRace();
       state = "menu";
       menu.showMain({ loading: false });
     },
@@ -412,8 +432,12 @@ async function init() {
       car.vy = 0;
       showMsg("TELEPORTED", 800, "#4be0c8");
     },
-    getRival: () => null,
+    getRival: () => rival,
   });
+  cityMap.onStartRace = (circuit) => {
+    cityMap.close();
+    startCircuitRace(circuit);
+  };
   document.getElementById("minimap").style.cursor = "pointer";
   document.getElementById("minimap").addEventListener("click", () => {
     const introWithControl = state === "intro" && intro?.hasPlayerControl();
@@ -565,6 +589,23 @@ function tick(dt, now) {
     }
     if (mp) mp.update(dt, car);
     if (remotePlayers) remotePlayers.update(dt);
+
+    if (race.state !== "idle") {
+      race.updateCatchUp(rival);
+      const t = race.target();
+      const playerDist = t ? Math.hypot(t.x - car.x, t.y - car.y) : 0;
+      if (rival) rival.update(dt, car, { cp: race.cpIndex, dist: playerDist });
+      const ev = race.update(dt, car);
+      if (ev?.type === "go") showMsg("GO!", 700, "#4be0c8");
+      else if (ev?.type === "checkpoint") showMsg(`CHECKPOINT ${race.cpIndex}/${race.checkpoints.length}`, 700, "#4be0c8");
+      else if (ev?.type === "finish") {
+        const msg = ev.isBest ? "NEW BEST!" : "FINISH";
+        showMsg(`${msg} ${race.time.toFixed(1)}s`, 2800, "#ffc24b");
+        const m = MISSIONS.find((x) => rival && x.name === rival.mission.name);
+        if (m && rival) markBeaten(m.id);
+        setTimeout(() => stopRace(), 3000);
+      }
+    }
   }
 
   // camera
@@ -638,6 +679,8 @@ function tick(dt, now) {
   } else {
     car.draw(ctx);
   }
+  if (rival) rival.draw(ctx, cam.x, cam.y, viewR + 100);
+  race.drawWorld(ctx, frame);
   car.drawFx(ctx);
   renderer.drawBuildings(cam, viewR + 30);
   police.drawHelicopter(ctx, cam.x, cam.y);
@@ -670,7 +713,8 @@ function tick(dt, now) {
       showMsg("YOU HAVE ARRIVED", 1200, "#ffc24b");
       waypoint = null;
     } else {
-      const ang = Math.atan2(waypoint.y - car.y, waypoint.x - car.x) - camRot;
+      const aim = routeAimPoint(world.roadGraph, car.x, car.y, waypoint.x, waypoint.y);
+      const ang = Math.atan2(aim.y - car.y, aim.x - car.x) - camRot;
       const wx = canvas.width / 2, wy = 86;
       ctx.save();
       ctx.translate(wx, wy);
@@ -762,7 +806,13 @@ function tick(dt, now) {
     fpsLast = fnow;
   }
   if (roaming) {
-    if (mp?.connected && mpRoom) {
+    if (race.state === "running" || race.state === "countdown") {
+      const t = race.time.toFixed(1);
+      ui.racehud.innerHTML =
+        `<span class="dim">${race.circuit?.label || "RACE"}</span><br>` +
+        `<span>CP ${race.cpIndex}/${race.checkpoints.length} · ${t}s</span>`;
+      race.drawArrow(ctx, canvas, car, camRot);
+    } else if (mp?.connected && mpRoom) {
       const near = remotePlayers?.nearbyCount() ?? 0;
       ui.racehud.innerHTML =
         `<span class="dim">MULTIPLAYER &mdash; ${mpRoom}</span><br>` +
@@ -774,7 +824,7 @@ function tick(dt, now) {
     ui.racehud.innerHTML = "";
   }
 
-  radar.draw(car, race, camRot, waypoint, null, police, speedZones);
+  radar.draw(car, race, camRot, waypoint, rival, police, speedZones);
 
   // Wanted level stars
   const stars = ui.wanted.querySelectorAll(".star");

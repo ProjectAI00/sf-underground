@@ -2,16 +2,12 @@
 // Cops drive with realistic physics (like player), try to box in, no slowdown on hit
 
 import { makeCarSprite, drawCarSprite, drawHeadlightBeams, SPRITE_PPM } from "./car.js";
+import { computeDriveInput, applyToCop, pickUnstuckSteer, streetRelation, streetEndAhead, pathBlockedByBuildings } from "./local-driver.js";
 import { elevOffset } from "./terrain.js";
 
 const POLICE_BODY = "#1a1a24";
 const SIREN_RED = "#ff3030";
 const SIREN_BLUE = "#3060ff";
-
-// Helicopter constants
-const HELI_SPEED = 95;
-const HELI_ACCEL = 40;
-const HELI_TURN_RATE = 6;
 
 const MAX_WANTED = 5;
 const ESCAPE_DISTANCE = 280;
@@ -27,7 +23,12 @@ const MAX_COPS = 8;
 const DESPAWN_DISTANCE = 400;
 const DESPAWN_DISTANCE_PURSUIT = 550;
 
-// Tier difficulty - cops match player tier capability
+// Cop top speed as fraction of player top speed: 1★=40%, 2★=50%, … 5★=80%
+function copSpeedRatio(wantedLevel) {
+  return 0.30 + wantedLevel * 0.10;
+}
+
+// Tier difficulty — patrol baseline, grip/steer caps; pursuit speed scales with wanted level
 const TIER_DIFFICULTY = {
   C: { maxSpeed: 38, accel: 18, grip: 8, steer: 2.4, escapeDistance: 1.1, maxStars: 3 },
   B: { maxSpeed: 48, accel: 24, grip: 10, steer: 2.6, escapeDistance: 1.0, maxStars: 4 },
@@ -179,6 +180,31 @@ export class Police {
     return TIER_DIFFICULTY[this.playerTier] || TIER_DIFFICULTY.B;
   }
 
+  /** Max pursuit speed — shared by ground cops and helicopter. */
+  #pursuitTopSpeed(player) {
+    const diff = this.#getDifficulty();
+    const playerTop = player.phys?.topSpeed ?? diff.maxSpeed;
+    if (this.wantedLevel <= 0) return Math.min(diff.maxSpeed, playerTop * 0.55);
+    return playerTop * copSpeedRatio(this.wantedLevel);
+  }
+
+  /** Scale cop performance to player car and current wanted level. */
+  #applyCopPerformance(c, player) {
+    const diff = this.#getDifficulty();
+    const playerAccel = player.phys?.engine ?? diff.accel;
+
+    if (this.wantedLevel <= 0 || !c.pursuing) {
+      c.maxSpeed = this.#pursuitTopSpeed(player);
+      c.accel = diff.accel * 0.85;
+    } else {
+      c.maxSpeed = this.#pursuitTopSpeed(player);
+      c.accel = playerAccel * (0.50 + this.wantedLevel * 0.09);
+    }
+
+    c.grip = diff.grip;
+    c.steerRate = diff.steer;
+  }
+
   #getSprite() {
     if (!this.sprite) this.sprite = makePoliceSprite();
     return this.sprite;
@@ -288,6 +314,8 @@ export class Police {
     }
     
     const playerSpeed = Math.hypot(player.vx || 0, player.vy || 0);
+    const heliTop = this.#pursuitTopSpeed(player);
+    const catchRatio = copSpeedRatio(this.wantedLevel);
     
     // Dynamic positioning - favor front and sides, rarely behind
     heli.positionPhase = (heli.positionPhase || 0) + dt * 0.25;
@@ -324,24 +352,28 @@ export class Police {
     const toDriftY = offsetY - heli.y;
     const driftDist = Math.hypot(toDriftX, toDriftY);
     
-    // Pursuit - slightly slower than player so escape is possible
-    const speedMult = this.wantedLevel >= 5 ? 0.95 : 0.90; // 5% slower at 5 stars, 10% otherwise
+    // Same top-speed cap as ground cops (80% of player at 5★, 70% at 4★, etc.)
     let desiredSpeed;
     if (distToTarget < 15) {
-      desiredSpeed = Math.min(20, driftDist * 1.0);
-    } else if (distToTarget < 50) {
-      desiredSpeed = Math.max(35, playerSpeed * speedMult);
+      desiredSpeed = Math.min(18, driftDist * 0.9);
+    } else if (distToPlayer > 100) {
+      desiredSpeed = heliTop;
     } else {
-      desiredSpeed = Math.max(HELI_SPEED, playerSpeed * speedMult);
+      desiredSpeed = Math.min(heliTop, playerSpeed * catchRatio);
     }
     
-    // Snappier acceleration
-    const accelRate = distToTarget > 60 ? 15 : 10;
+    const accelRate = distToTarget > 60 ? 12 : 8;
     const targetVx = driftDist > 1 ? (toDriftX / driftDist) * desiredSpeed : 0;
     const targetVy = driftDist > 1 ? (toDriftY / driftDist) * desiredSpeed : 0;
     
     heli.vx += (targetVx - heli.vx) * Math.min(1, accelRate * dt * 0.15);
     heli.vy += (targetVy - heli.vy) * Math.min(1, accelRate * dt * 0.15);
+
+    const heliSpd = Math.hypot(heli.vx, heli.vy);
+    if (heliSpd > heliTop) {
+      heli.vx *= heliTop / heliSpd;
+      heli.vy *= heliTop / heliSpd;
+    }
     
     heli.x += heli.vx * dt;
     heli.y += heli.vy * dt;
@@ -443,10 +475,38 @@ export class Police {
       sirenPhase: Math.random() * Math.PI * 2,
       steer: 0,
       throttle: 0,
+      handbrake: false,
+      stuckT: 0,
+      unstuckT: 0,
+      unstuckSteer: 1,
+      route: null,
+      routeT: 0,
+      routeGx: 0,
+      routeGy: 0,
+      routeMode: null,
+      lastX: near.x,
+      lastY: near.y,
       crashT: 0,
       disabled: false,
       disabledTimer: 0,
     });
+  }
+
+  #snapToRoad(c) {
+    const inBuilding = this.world.buildingAt(c.x, c.y);
+    const near = this.world.nearestRoad(c.x, c.y, 120);
+    if (!inBuilding && (!near || near.d < 18)) return false;
+
+    if (near) {
+      c.x = near.x;
+      c.y = near.y;
+      if (inBuilding || near.d > 25) {
+        c.h = Math.atan2(near.ty, near.tx);
+        c.vx *= 0.2;
+        c.vy *= 0.2;
+      }
+    }
+    return true;
   }
 
   #updateCops(dt, player, traffic) {
@@ -468,7 +528,19 @@ export class Police {
         c.y += c.vy * dt;
         continue;
       }
-      
+
+      this.#snapToRoad(c);
+      this.#applyCopPerformance(c, player);
+      this.#updateStuck(c, dt);
+
+      if (c.unstuckT > 0) {
+        this.#applyUnstuck(c, dt);
+        this.#applyCarPhysics(c, dt);
+        c.sirenPhase += dt * 8;
+        c.crashT = Math.max(0, c.crashT - dt);
+        continue;
+      }
+
       // Activate pursuit if wanted and nearby
       if (this.wantedLevel > 0 && !c.pursuing) {
         const dist = Math.hypot(player.x - c.x, player.y - c.y);
@@ -487,194 +559,208 @@ export class Police {
   }
 
   #updatePatrol(c, dt) {
-    // Simple patrol: follow road, maintain speed
     const near = this.world.nearestRoad(c.x, c.y, 50);
-    const speed = Math.hypot(c.vx, c.vy);
-    
-    let targetH = c.h;
+    let goal = { x: c.x + Math.cos(c.h) * 40, y: c.y + Math.sin(c.h) * 40 };
     if (near) {
-      // Follow road direction
       const dot = Math.cos(c.h) * near.tx + Math.sin(c.h) * near.ty;
       const dir = dot >= 0 ? 1 : -1;
-      targetH = Math.atan2(near.ty * dir, near.tx * dir);
-      
-      // Steer toward road center if drifting off
-      if (near.d > 3) {
-        const toRoad = Math.atan2(near.y - c.y, near.x - c.x);
-        targetH = blendAngles(targetH, toRoad, 0.3);
+      goal = { x: c.x + near.tx * dir * 50, y: c.y + near.ty * dir * 50 };
+    }
+    const input = computeDriveInput(this.world, {
+      x: c.x, y: c.y, h: c.h, vx: c.vx, vy: c.vy, skill: 0.7, cornering: 6,
+    }, goal, { forPolice: true, roadBias: 0.7, probeDist: 28 });
+    applyToCop(c, input, dt);
+    this.#applyCarPhysics(c, dt);
+  }
+
+  #applyUnstuck(c, dt) {
+    c.unstuckT -= dt;
+    const input = computeDriveInput(this.world, {
+      x: c.x, y: c.y, h: c.h, vx: c.vx, vy: c.vy,
+    }, { x: c.x, y: c.y }, { unstuck: true, unstuckSteer: c.unstuckSteer });
+    applyToCop(c, input, dt);
+    if (c.unstuckT <= 0) {
+      const near = this.world.nearestRoad(c.x, c.y, 80);
+      if (near) c.h = Math.atan2(near.ty, near.tx);
+    }
+  }
+
+  #updateStuck(c, dt) {
+    if (c.unstuckT > 0) return;
+
+    const speed = Math.hypot(c.vx, c.vy);
+    const moved = Math.hypot(c.x - c.lastX, c.y - c.lastY);
+    const near = this.world.nearestRoad(c.x, c.y, 80);
+    const onRoad = near && near.d < 12;
+    const inBuilding = this.world.buildingAt(c.x, c.y);
+    const fx = Math.cos(c.h), fy = Math.sin(c.h);
+    const noseIn = this.world.buildingAt(c.x + fx * 3, c.y + fy * 3)
+      || this.world.buildingAt(c.x + fx * 6, c.y + fy * 6);
+    const touching = inBuilding || noseIn
+      || this.world.buildingAt(c.x + fx * 2.5, c.y + fy * 2.5)
+      || this.world.buildingAt(c.x + fx * 4, c.y + fy * 4);
+    const trying = c.throttle > 0.2 || Math.abs(c.throttle) > 0.2;
+
+    if (inBuilding || (noseIn && trying)) {
+      c.stuckT = 1;
+    } else if (trying && (touching || !onRoad) && (speed < 8 || moved < 0.8 * dt)) {
+      c.stuckT += dt * (touching ? 2.5 : 1);
+    } else {
+      c.stuckT = Math.max(0, c.stuckT - dt * 2);
+    }
+
+    if (c.stuckT > 0.08) {
+      c.unstuckT = noseIn ? 1.0 : 0.85;
+      c.unstuckSteer = pickUnstuckSteer(this.world, c.x, c.y, c.h);
+      c.stuckT = 0;
+      c.handbrake = false;
+      c.throttle = -0.7;
+      if (near && (inBuilding || near.d > 14)) {
+        c.x = near.x;
+        c.y = near.y;
+        c.vx *= 0.15;
+        c.vy *= 0.15;
       }
     }
-    
-    // Steering
-    const steerDelta = angDiff(targetH, c.h);
-    c.steer = clamp(steerDelta * 2, -1, 1);
-    c.h += c.steer * c.steerRate * dt;
-    
-    // Throttle to maintain patrol speed (~50 km/h)
-    const targetSpeed = 14;
-    c.throttle = speed < targetSpeed ? 0.5 : 0;
-    
-    // Apply physics
-    this.#applyCarPhysics(c, dt);
+
+    c.lastX = c.x;
+    c.lastY = c.y;
   }
 
   #updatePursuit(c, dt, player) {
     const dx = player.x - c.x;
     const dy = player.y - c.y;
     const dist = Math.hypot(dx, dy);
-    const playerSpeed = Math.hypot(player.vx || 0, player.vy || 0);
     const copSpeed = Math.hypot(c.vx, c.vy);
-    
-    // Predict player position based on role
+    const relation = streetRelation(this.world, c.x, c.y, player.x, player.y);
+    const onParallel = relation === "parallel" && dist > 40;
+
     let targetX, targetY;
-    
-    switch (c.role) {
-      case "block_front": {
-        // Get ahead of player and block
-        const predictTime = Math.min(4, dist / Math.max(copSpeed, 20));
-        targetX = player.x + (player.vx || 0) * predictTime * 1.5;
-        targetY = player.y + (player.vy || 0) * predictTime * 1.5;
-        // If we're ahead, slow down and position
-        const aheadDot = dx * (player.vx || 0.001) + dy * (player.vy || 0.001);
-        if (aheadDot < 0 && dist < 50) {
-          // We're ahead - try to get in front
-          targetX = player.x + (player.vx || 0) * 2;
-          targetY = player.y + (player.vy || 0) * 2;
+    let routeAhead = 85;
+    const playerBlocked = pathBlockedByBuildings(this.world, c.x, c.y, player.x, player.y);
+    const mustCommitStreet = onParallel || (relation !== "same" && playerBlocked && dist > 35);
+
+    if (mustCommitStreet) {
+      const ahead = streetEndAhead(this.world, c.x, c.y, c.h, 90);
+      targetX = ahead.x;
+      targetY = ahead.y;
+    } else if (relation === "same" || dist < 50) {
+      switch (c.role) {
+        case "block_front": {
+          const predictTime = Math.min(2, dist / Math.max(copSpeed, 25));
+          targetX = player.x + (player.vx || 0) * predictTime;
+          targetY = player.y + (player.vy || 0) * predictTime;
+          break;
         }
-        break;
-      }
-      case "flank": {
-        // Come from the side
-        const predictTime = Math.min(2, dist / Math.max(copSpeed, 20));
-        const baseX = player.x + (player.vx || 0) * predictTime;
-        const baseY = player.y + (player.vy || 0) * predictTime;
-        // Offset to side based on which side we're on
-        const side = (c.x - player.x) * (player.vy || 0) - (c.y - player.y) * (player.vx || 0);
-        const perpX = -(player.vy || 0);
-        const perpY = (player.vx || 0);
-        const perpLen = Math.hypot(perpX, perpY) || 1;
-        const sideSign = side > 0 ? 1 : -1;
-        // Target: player position offset to their side
-        if (dist > 30) {
-          targetX = baseX + (perpX / perpLen) * sideSign * 15;
-          targetY = baseY + (perpY / perpLen) * sideSign * 15;
-        } else {
-          // Close enough - ram into side
-          targetX = player.x + (perpX / perpLen) * sideSign * 3;
-          targetY = player.y + (perpY / perpLen) * sideSign * 3;
+        case "flank": {
+          const predictTime = Math.min(1.2, dist / Math.max(copSpeed, 25));
+          const baseX = player.x + (player.vx || 0) * predictTime;
+          const baseY = player.y + (player.vy || 0) * predictTime;
+          const side = (c.x - player.x) * (player.vy || 0) - (c.y - player.y) * (player.vx || 0);
+          const perpX = -(player.vy || 0);
+          const perpY = (player.vx || 0);
+          const perpLen = Math.hypot(perpX, perpY) || 1;
+          const sideSign = side > 0 ? 1 : -1;
+          targetX = baseX + (perpX / perpLen) * sideSign * (dist > 30 ? 12 : 4);
+          targetY = baseY + (perpY / perpLen) * sideSign * (dist > 30 ? 12 : 4);
+          break;
         }
-        break;
-      }
-      case "chase":
-      default: {
-        // Direct pursuit with slight prediction
-        const predictTime = Math.min(1.5, dist / Math.max(copSpeed, 15));
-        targetX = player.x + (player.vx || 0) * predictTime;
-        targetY = player.y + (player.vy || 0) * predictTime;
-        break;
-      }
-    }
-    
-    // Calculate desired heading
-    const toTargetX = targetX - c.x;
-    const toTargetY = targetY - c.y;
-    let targetH = Math.atan2(toTargetY, toTargetX);
-    
-    // Avoid buildings - probe ahead
-    const fx = Math.cos(c.h);
-    const fy = Math.sin(c.h);
-    const probeLen = 15 + copSpeed * 0.15;
-    
-    for (let d = 5; d <= probeLen; d += 5) {
-      if (this.world.buildingAt(c.x + fx * d, c.y + fy * d)) {
-        // Building ahead - find clear direction
-        const rx = -fy, ry = fx;
-        const leftClear = !this.world.buildingAt(c.x + fx * d + rx * 8, c.y + fy * d + ry * 8);
-        const rightClear = !this.world.buildingAt(c.x + fx * d - rx * 8, c.y + fy * d - ry * 8);
-        
-        if (leftClear && !rightClear) {
-          targetH = c.h + 0.8;
-        } else if (rightClear && !leftClear) {
-          targetH = c.h - 0.8;
-        } else if (!leftClear && !rightClear) {
-          targetH = c.h + Math.PI; // Dead end, reverse
+        case "chase":
+        default: {
+          const predictTime = Math.min(0.8, dist / Math.max(copSpeed, 20));
+          targetX = player.x + (player.vx || 0) * predictTime;
+          targetY = player.y + (player.vy || 0) * predictTime;
+          break;
         }
-        break;
       }
-    }
-    
-    // Steering toward target
-    const steerDelta = angDiff(targetH, c.h);
-    const steerInput = clamp(steerDelta * 3, -1, 1);
-    c.steer += (steerInput - c.steer) * Math.min(1, 8 * dt);
-    
-    // Throttle control based on situation
-    const building = this.world.buildingAt(c.x + fx * 10, c.y + fy * 10);
-    const sharpTurn = Math.abs(steerDelta) > 0.8;
-    
-    if (building) {
-      c.throttle = -0.3; // Brake hard
-    } else if (sharpTurn && copSpeed > 15) {
-      c.throttle = 0.2; // Ease off for turns
-    } else if (dist < 15 && c.role !== "chase") {
-      // Close to player - match speed for boxing
-      c.throttle = playerSpeed > copSpeed ? 0.8 : 0.3;
+      routeAhead = 75;
     } else {
-      c.throttle = 1; // Full pursuit
+      targetX = player.x;
+      targetY = player.y;
+      routeAhead = 80;
     }
-    
-    // Apply physics
+
+    const modeChanged = c.routeMode !== (mustCommitStreet ? "commit" : relation);
+    const reachedJunction = mustCommitStreet && Math.hypot(c.x - c.routeGx, c.y - c.routeGy) < 28;
+    const goalMoved = !mustCommitStreet && Math.hypot(targetX - (c.routeGx ?? 0), targetY - (c.routeGy ?? 0)) > 40;
+
+    if (!c.route || c.routeT <= 0 || modeChanged || reachedJunction || goalMoved) {
+      c.route = this.world.roadGraph?.findRoute(c.x, c.y, targetX, targetY) || null;
+      c.routeT = mustCommitStreet ? 1.6 : 0.55;
+      c.routeGx = targetX;
+      c.routeGy = targetY;
+      c.routeMode = mustCommitStreet ? "commit" : relation;
+    } else {
+      c.routeT -= dt;
+    }
+
+    const input = computeDriveInput(this.world, {
+      x: c.x, y: c.y, h: c.h, vx: c.vx, vy: c.vy,
+      skill: c.role === "chase" ? 0.85 : 0.75,
+      cornering: 7,
+    }, { x: targetX, y: targetY }, {
+      forPolice: true,
+      roadBias: mustCommitStreet ? 0.92 : 0.78,
+      probeDist: 28 + copSpeed * 0.1,
+      route: c.route,
+      routeAhead,
+    });
+    applyToCop(c, input, dt);
     this.#applyCarPhysics(c, dt);
   }
-  
+
   #applyCarPhysics(c, dt) {
-    // Same physics model as player car
     const fx = Math.cos(c.h);
     const fy = Math.sin(c.h);
     const rx = -fy;
     const ry = fx;
-    
-    // Decompose velocity into forward/lateral
+
     let vF = c.vx * fx + c.vy * fy;
     let vL = c.vx * rx + c.vy * ry;
-    
-    // Acceleration/braking
+    const speed = Math.abs(vF);
+
     if (c.throttle > 0) {
       const accelForce = c.accel * c.throttle * (1 - Math.max(0, vF) / c.maxSpeed);
       vF += accelForce * dt;
     } else if (c.throttle < 0) {
-      vF -= c.brake * (-c.throttle) * dt;
+      if (speed < 3) {
+        vF -= c.accel * 0.55 * (-c.throttle) * dt;
+      } else {
+        vF -= c.brake * (-c.throttle) * dt;
+      }
     }
-    
-    // Natural drag
+
     vF -= vF * 0.15 * dt;
-    
-    // Steering
-    const speed = Math.abs(vF);
+
     const steerGain = c.steerRate * Math.min(1, speed / 10) * (1 - Math.min(0.4, speed / 100));
     c.h += c.steer * steerGain * (vF < -0.5 ? -1 : 1) * dt;
-    
-    // Grip (lateral velocity decay)
-    const grip = c.grip;
-    vL -= vL * Math.min(1, grip * dt);
-    
-    // Recompose velocity
+
+    const naturalSlip = 1 - Math.min(0.35, Math.abs(c.steer) * speed / 180);
+    vL -= vL * Math.min(1, c.grip * naturalSlip * dt);
+
     const newFx = Math.cos(c.h);
     const newFy = Math.sin(c.h);
     const newRx = -newFy;
     const newRy = newFx;
     c.vx = newFx * vF + newRx * vL;
     c.vy = newFy * vF + newRy * vL;
-    
-    // Movement with collision
+
     const newX = c.x + c.vx * dt;
     const newY = c.y + c.vy * dt;
-    
+
     if (this.world.buildingAt(newX, newY)) {
-      // Hit building - bounce back
-      c.vx *= -0.3;
-      c.vy *= -0.3;
-      c.crashT = 0.2;
+      if (!this.world.buildingAt(newX, c.y)) {
+        c.x = newX;
+        c.vy *= 0.2;
+      } else if (!this.world.buildingAt(c.x, newY)) {
+        c.y = newY;
+        c.vx *= 0.2;
+      } else {
+        c.vx *= 0.45;
+        c.vy *= 0.45;
+        c.stuckT = Math.min(1, (c.stuckT || 0) + dt * 0.8);
+      }
+      if (speed > 6) c.crashT = 0.15;
     } else {
       c.x = newX;
       c.y = newY;
